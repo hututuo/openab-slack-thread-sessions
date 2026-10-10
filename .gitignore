@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+.env.*
+config.toml
+thread_map.json
+session_meta.json
+sessions.json
+bindings.json
+*.log
+target/
+private*/

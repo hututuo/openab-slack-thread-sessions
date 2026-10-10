@@ -1,0 +1,1273 @@
+--- a/crates/openab-core/src/acp/pool.rs
++++ b/crates/openab-core/src/acp/pool.rs
+@@ -802,6 +802,31 @@
+         };
+         let mut conn = conn.lock().await;
+         conn.set_config_option(config_id, value).await
++    }
++
++    /// Nonblocking snapshot for interactive controls. None means a turn is busy.
++    pub async fn try_config_snapshot(&self, thread_id: &str) -> Result<Option<(String, Vec<ConfigOption>)>> {
++        let conn = self.state.read().await.active.get(thread_id).cloned()
++            .ok_or_else(|| anyhow!("no active session"))?;
++        let Ok(conn) = conn.try_lock() else { return Ok(None); };
++        let session = conn.acp_session_id.clone().ok_or_else(|| anyhow!("no ACP session"))?;
++        Ok(Some((session, conn.config_options.clone())))
++    }
++
++    /// Never queue a stale menu selection behind a running prompt or use another session.
++    pub async fn try_set_config_for_session(&self, thread_id: &str, expected_session: &str,
++        config_id: &str, value: &str) -> Result<Option<Vec<ConfigOption>>> {
++        let conn = self.state.read().await.active.get(thread_id).cloned()
++            .ok_or_else(|| anyhow!("stale model menu"))?;
++        let Ok(mut conn) = conn.try_lock() else { return Ok(None); };
++        if conn.acp_session_id.as_deref() != Some(expected_session) {
++            return Err(anyhow!("stale model menu"));
++        }
++        if !conn.config_options.iter().any(|o| o.id == config_id && o.category.as_deref() == Some("model")
++            && o.options.iter().any(|v| v.value == value)) {
++            return Err(anyhow!("model no longer offered by backend"));
++        }
++        Ok(Some(conn.set_config_option(config_id, value).await?))
+     }
+ 
+     /// Query account-level usage/billing from the backend agent for a session
+@@ -1091,6 +1116,64 @@
+     use tokio::sync::Mutex;
+     use tokio::time::Instant;
+ 
++    #[tokio::test]
++    async fn model_controls_reject_busy_stale_and_unknown_without_changing_other_thread() {
++        let root = std::env::temp_dir().join(format!("openab-model-controls-{}", uuid::Uuid::new_v4()));
++        std::fs::create_dir_all(&root).unwrap();
++        let script = root.join("backend.py");
++        std::fs::write(&script, r#"
++import sys,json,os
++store=os.path.join(os.path.dirname(__file__),'models.json')
++try:sessions=json.load(open(store))
++except FileNotFoundError:sessions={}
++model='m1';sid=''
++def opts():return [{'id':'model','name':'Model','category':'model','type':'select','currentValue':model,'options':[{'value':'m1','name':'One'},{'value':'m2','name':'Two'}]}]
++for line in sys.stdin:
++ q=json.loads(line);method=q.get('method');p=q.get('params',{});r={}
++ if method=='initialize':r={'protocolVersion':1,'agentCapabilities':{'loadSession':True},'agentInfo':{'name':'fixture','version':'1'}}
++ elif method=='session/new':sid=str(os.getpid());model='m1';sessions[sid]=model;json.dump(sessions,open(store,'w'));r={'sessionId':sid,'configOptions':opts()}
++ elif method=='session/load':sid=p['sessionId'];model=sessions[sid];r={'configOptions':opts()}
++ elif method=='session/set_config_option':model=p['value'];sessions[sid]=model;json.dump(sessions,open(store,'w'));r={'configOptions':opts()}
++ print(json.dumps({'jsonrpc':'2.0','id':q['id'],'result':r}),flush=True)
++"#).unwrap();
++        let mut config = crate::config::AgentConfig::default();
++        config.command = "/usr/bin/python3".into();
++        config.args = vec![script.to_string_lossy().into()];
++        config.working_dir = root.to_string_lossy().into();
++        let second_config = crate::config::AgentConfig {
++            command:config.command.clone(), args:config.args.clone(), working_dir:config.working_dir.clone(),
++            env:HashMap::new(), inherit_env:vec![], command_explicit:true,
++        };
++        let pool = super::SessionPool::new_in(config, 2, 0, HashMap::new(), root.join("state"));
++        pool.get_or_create("slack:one",None).await.unwrap();
++        pool.get_or_create("slack:two",None).await.unwrap();
++        let (session,_) = pool.try_config_snapshot("slack:one").await.unwrap().unwrap();
++        let conn = pool.state.read().await.active.get("slack:one").unwrap().clone();
++        let busy = conn.lock().await;
++        assert!(pool.try_config_snapshot("slack:one").await.unwrap().is_none());
++        assert!(pool.try_set_config_for_session("slack:one",&session,"model","m2").await.unwrap().is_none());
++        drop(busy);
++        assert!(pool.try_set_config_for_session("slack:one","other-session","model","m2").await.is_err());
++        assert!(pool.try_set_config_for_session("slack:one",&session,"model","invented").await.is_err());
++        let changed = pool.try_set_config_for_session("slack:one",&session,"model","m2").await.unwrap().unwrap();
++        assert_eq!(changed[0].current_value,"m2");
++        assert_eq!(pool.try_config_snapshot("slack:two").await.unwrap().unwrap().1[0].current_value,"m1");
++        pool.shutdown().await;
++        // The deployed pool has capacity one. Eviction/load must preserve each model.
++        let small = super::SessionPool::new_in(second_config, 1, 0, HashMap::new(), root.join("small-state"));
++        small.get_or_create("slack:one",None).await.unwrap();
++        let (one,_) = small.try_config_snapshot("slack:one").await.unwrap().unwrap();
++        small.try_set_config_for_session("slack:one",&one,"model","m2").await.unwrap();
++        small.get_or_create("slack:two",None).await.unwrap();
++        assert_eq!(small.try_config_snapshot("slack:two").await.unwrap().unwrap().1[0].current_value,"m1");
++        small.get_or_create("slack:one",None).await.unwrap();
++        assert_eq!(small.try_config_snapshot("slack:one").await.unwrap().unwrap().1[0].current_value,"m2");
++        small.get_or_create("slack:two",None).await.unwrap();
++        assert_eq!(small.try_config_snapshot("slack:two").await.unwrap().unwrap().1[0].current_value,"m1");
++        small.shutdown().await;
++        std::fs::remove_dir_all(root).unwrap();
++    }
++
+     /// Registrar double that records every mint, so a test can assert one never happened.
+     #[cfg(feature = "acp-mcp")]
+     #[derive(Default)]
+--- a/crates/openab-core/src/config.rs
++++ b/crates/openab-core/src/config.rs
+@@ -605,6 +605,9 @@
+     pub allowed_users: Vec<String>,
+     #[serde(default)]
+     pub allow_bot_messages: AllowBots,
++    /// Explicit human owner for thread model controls; unset disables controls.
++    #[serde(default)]
++    pub model_selector_owner: Option<String>,
+     /// Bot User IDs (U...) allowed to interact when allow_bot_messages is
+     /// "mentions" or "all". Find via Slack UI: click bot profile → Copy member ID.
+     /// Empty = allow any bot (mode permitting).
+--- a/crates/openab-core/src/lib.rs
++++ b/crates/openab-core/src/lib.rs
+@@ -34,3 +34,6 @@
+ pub mod ambient;
+ #[cfg(feature = "slack")]
+ pub mod slack;
++
++#[cfg(feature = "slack")]
++mod slack_models;
+--- a/crates/openab-core/src/media.rs
++++ b/crates/openab-core/src/media.rs
+@@ -15,6 +15,30 @@
+         .build()
+         .expect("static HTTP client must build")
+ });
++
++/// reqwest error displays can include signed attachment URLs. Keep log values
++/// static rather than rendering URLs, response content, or request headers.
++pub(crate) fn download_error_kind(error: &reqwest::Error) -> &'static str {
++    if error.is_timeout() {
++        "timeout"
++    } else if error.is_connect() {
++        "connect"
++    } else if error.is_builder() {
++        "builder"
++    } else if error.is_redirect() {
++        "redirect"
++    } else if error.is_status() {
++        "http_status"
++    } else if error.is_body() {
++        "body"
++    } else if error.is_decode() {
++        "decode"
++    } else if error.is_request() {
++        "request"
++    } else {
++        "network"
++    }
++}
+ 
+ /// Maximum dimension (width or height) for resized images.
+ const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
+@@ -225,12 +249,12 @@
+     let response = match req.send().await {
+         Ok(resp) => resp,
+         Err(e) => {
+-            error!(url, error = %e, "download failed");
++            error!(error_kind = download_error_kind(&e), "download failed");
+             return Err(MediaFetchError::Network(e));
+         }
+     };
+     if !response.status().is_success() {
+-        error!(url, status = %response.status(), "HTTP error downloading image");
++        error!(status = %response.status(), "HTTP error downloading image");
+         return Err(MediaFetchError::HttpStatus(response.status()));
+     }
+ 
+@@ -244,7 +268,7 @@
+     let bytes = match response.bytes().await {
+         Ok(b) => b,
+         Err(e) => {
+-            error!(url, error = %e, "read failed");
++            error!(error_kind = download_error_kind(&e), "read failed");
+             return Err(MediaFetchError::Network(e));
+         }
+     };
+@@ -327,18 +351,18 @@
+     let resp = match req.send().await {
+         Ok(r) => r,
+         Err(e) => {
+-            error!(url, error = %e, "audio download request failed");
++            error!(error_kind = download_error_kind(&e), "audio download request failed");
+             return None;
+         }
+     };
+     if !resp.status().is_success() {
+-        error!(url, status = %resp.status(), "audio download failed");
++        error!(status = %resp.status(), "audio download failed");
+         return None;
+     }
+     let bytes = match resp.bytes().await {
+         Ok(b) => b.to_vec(),
+         Err(e) => {
+-            error!(url, error = %e, "audio body read failed");
++            error!(error_kind = download_error_kind(&e), "audio body read failed");
+             return None;
+         }
+     };
+@@ -549,12 +573,12 @@
+     let resp = match req.send().await {
+         Ok(r) => r,
+         Err(e) => {
+-            tracing::warn!(url, error = %e, "text file download failed");
++            tracing::warn!(error_kind = download_error_kind(&e), "text file download failed");
+             return None;
+         }
+     };
+     if !resp.status().is_success() {
+-        tracing::warn!(url, status = %resp.status(), "text file download failed");
++        tracing::warn!(status = %resp.status(), "text file download failed");
+         return None;
+     }
+ 
+@@ -585,8 +609,8 @@
+                         tracing::info!(filename, size = actual_bytes, "text file streamed to filestore (inline fallback)");
+                         Some((ContentBlock::Text { text: hint }, 0))
+                     }
+-                    Ok(Err(e)) => {
+-                        tracing::error!(filename, error = %e, "filestore stream upload failed (inline fallback)");
++                    Ok(Err(_)) => {
++                        tracing::error!(filename, error_kind = "filestore_upload", "filestore stream upload failed (inline fallback)");
+                         let size_kb = content_length / 1024;
+                         let hint = format!(
+                             "[File: {safe_filename}]\n\
+@@ -613,7 +637,7 @@
+     let bytes = match resp.bytes().await {
+         Ok(b) => b,
+         Err(e) => {
+-            tracing::warn!(url, error = %e, "text file body read failed");
++            tracing::warn!(error_kind = download_error_kind(&e), "text file body read failed");
+             return None;
+         }
+     };
+@@ -672,18 +696,18 @@
+     let resp = match req.send().await {
+         Ok(r) => r,
+         Err(e) => {
+-            tracing::warn!(url, error = %e, "text file download failed");
++            tracing::warn!(error_kind = download_error_kind(&e), "text file download failed");
+             return None;
+         }
+     };
+     if !resp.status().is_success() {
+-        tracing::warn!(url, status = %resp.status(), "text file download failed");
++        tracing::warn!(status = %resp.status(), "text file download failed");
+         return None;
+     }
+     let bytes = match resp.bytes().await {
+         Ok(b) => b,
+         Err(e) => {
+-            tracing::warn!(url, error = %e, "text file body read failed");
++            tracing::warn!(error_kind = download_error_kind(&e), "text file body read failed");
+             return None;
+         }
+     };
+@@ -757,12 +781,12 @@
+     let resp = match req.send().await {
+         Ok(r) => r,
+         Err(e) => {
+-            tracing::warn!(url, error = %e, "text file download failed (filestore path)");
++            tracing::warn!(error_kind = download_error_kind(&e), "text file download failed (filestore path)");
+             return None;
+         }
+     };
+     if !resp.status().is_success() {
+-        tracing::warn!(url, status = %resp.status(), "text file download failed (filestore path)");
++        tracing::warn!(status = %resp.status(), "text file download failed (filestore path)");
+         return None;
+     }
+ 
+@@ -804,8 +828,8 @@
+             tracing::info!(filename, size = actual_bytes, "text file streamed to filestore");
+             Some((ContentBlock::Text { text: hint }, 0))
+         }
+-        Ok(Err(e)) => {
+-            tracing::error!(filename, error = %e, "filestore stream upload failed");
++        Ok(Err(_)) => {
++            tracing::error!(filename, error_kind = "filestore_upload", "filestore stream upload failed");
+             let size_kb = size / 1024;
+             let hint = format!(
+                 "[File: {safe_filename}]\n\
+@@ -869,12 +893,12 @@
+     let resp = match req.send().await {
+         Ok(r) => r,
+         Err(e) => {
+-            tracing::warn!(url, error = %e, "file download failed (filestore any-file path)");
++            tracing::warn!(error_kind = download_error_kind(&e), "file download failed (filestore any-file path)");
+             return None;
+         }
+     };
+     if !resp.status().is_success() {
+-        tracing::warn!(url, status = %resp.status(), "file download failed (filestore any-file path)");
++        tracing::warn!(status = %resp.status(), "file download failed (filestore any-file path)");
+         return None;
+     }
+ 
+@@ -925,8 +949,8 @@
+             tracing::info!(filename, mime, size = actual_bytes, "file uploaded to filestore (any-file path)");
+             Some((ContentBlock::Text { text: hint }, 0))
+         }
+-        Ok(Err(e)) => {
+-            tracing::error!(filename, error = %e, "filestore upload failed (any-file path)");
++        Ok(Err(_)) => {
++            tracing::error!(filename, error_kind = "filestore_upload", "filestore upload failed (any-file path)");
+             let size_kb = size / 1024;
+             let hint = format!(
+                 "[File: {safe_filename}]\n\
+@@ -990,8 +1014,8 @@
+             // caller's aggregate size cap.
+             Some((ContentBlock::Text { text: hint }, 0))
+         }
+-        Err(e) => {
+-            tracing::error!(filename, error = %e, "filestore upload failed");
++        Err(_) => {
++            tracing::error!(filename, error_kind = "filestore_upload", "filestore upload failed");
+             // Return a degraded hint so the agent knows the file exists
+             let size_kb = actual_size / 1024;
+             let hint = format!(
+@@ -1007,6 +1031,41 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++
++    #[test]
++    fn attachment_failure_logs_exclude_signed_url_and_authorization() {
++        #[derive(Clone)]
++        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
++        impl std::io::Write for Capture {
++            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
++                self.0.lock().unwrap().extend_from_slice(bytes);
++                Ok(bytes.len())
++            }
++            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
++        }
++        let capture = Capture(Default::default());
++        let output = capture.0.clone();
++        let subscriber = tracing_subscriber::fmt()
++            .without_time()
++            .with_ansi(false)
++            .with_max_level(tracing::Level::WARN)
++            .with_writer(move || capture.clone())
++            .finish();
++        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
++        let url = "unsupported://example.invalid/private.png?signature=SIGNED_QUERY_SECRET";
++        let result = tracing::subscriber::with_default(subscriber, || {
++            runtime.block_on(download_and_encode_image(
++                url, Some("image/png"), "private.png", 10, Some("xoxb-AUTHORIZATION_SECRET"),
++            ))
++        });
++        assert!(matches!(result, Err(MediaFetchError::Network(_))));
++        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
++        assert!(logs.contains("download failed"));
++        assert!(logs.contains("error_kind="));
++        for secret in [url, "SIGNED_QUERY_SECRET", "AUTHORIZATION_SECRET", "Authorization", "xoxb-"] {
++            assert!(!logs.contains(secret), "attachment log exposed secret data");
++        }
++    }
+ 
+     fn make_png(width: u32, height: u32) -> Vec<u8> {
+         let img = image::RgbImage::new(width, height);
+--- a/crates/openab-core/src/slack.rs
++++ b/crates/openab-core/src/slack.rs
+@@ -46,6 +46,66 @@
+     }
+ }
+ 
++/// Human channel mentions are delivered via app_mention; bot mentions must use
++/// message events and retain the trust + configured turn-limit checks there.
++fn route_mention_via_app_event(is_bot: bool, is_dm: bool, mentions_bot: bool) -> bool {
++    mentions_bot && !is_dm && !is_bot
++}
++
++fn route_mention_via_message_event(is_bot: bool, is_dm: bool, mentions_bot: bool) -> bool {
++    mentions_bot && !route_mention_via_app_event(is_bot, is_dm, mentions_bot)
++}
++
++/// Slack-only unlimited mode. Never enter the shared tracker at zero: it has
++/// both a soft limit and an independent hard cap, used by other platforms too.
++/// Self events are ignored before either counter can change, even at a positive limit.
++fn classify_slack_bot_turn(
++    tracker: &mut BotTurnTracker,
++    max_bot_turns: u32,
++    thread: &str,
++    is_own_bot: bool,
++) -> TurnAction {
++    if is_own_bot {
++        TurnAction::SilentStop
++    } else if max_bot_turns == 0 {
++        TurnAction::Continue
++    } else {
++        tracker.classify_bot_message(thread)
++    }
++}
++
++fn slack_history_cap_enabled(allow_bot_messages: AllowBots, max_bot_turns: u32) -> bool {
++    matches!(allow_bot_messages, AllowBots::All) && max_bot_turns > 0
++}
++
++fn slack_bot_has_target(has_thread: bool, mentions_bot: bool) -> bool {
++    has_thread || mentions_bot
++}
++
++fn slack_bot_has_trigger(mode: AllowBots, is_dm: bool, has_thread: bool, mentions_bot: bool) -> bool {
++    match mode {
++        AllowBots::Off => false,
++        AllowBots::Mentions => route_mention_via_message_event(true, is_dm, mentions_bot),
++        AllowBots::All => slack_bot_has_target(has_thread, mentions_bot),
++    }
++}
++
++fn slack_dm_has_trigger(allow_user_messages: AllowUsers, mentions_bot: bool) -> bool {
++    !matches!(allow_user_messages, AllowUsers::Mentions)
++        || route_mention_via_message_event(false, true, mentions_bot)
++}
++
++fn slack_is_own_sender(bot_uid: Option<&str>, sender_uid: Option<&str>) -> bool {
++    bot_uid.is_some_and(|uid| !uid.is_empty() && sender_uid == Some(uid))
++}
++
++fn reset_human_mention_turns(tracker: &mut BotTurnTracker, event: &serde_json::Value, admitted: bool) {
++    if !admitted { return; }
++    let key = event["thread_ts"].as_str().map(str::to_string).unwrap_or_else(||
++        format!("{}:{}", event["channel"].as_str().unwrap_or(""), event["ts"].as_str().unwrap_or("")));
++    tracker.on_human_message(&key);
++}
++
+ // --- SlackAdapter: implements ChatAdapter for Slack ---
+ 
+ /// TTL for cached user display names (5 minutes).
+@@ -92,6 +152,8 @@
+     /// Lifecycle: stream_begin inserts, stream_finish removes; insert_stream
+     /// bounds the map (STREAM_CACHE_MAX) as a safety net against aborted turns.
+     streams: tokio::sync::Mutex<HashMap<String, StreamEntry>>,
++    model_owner: tokio::sync::OnceCell<String>,
++    model_menus: tokio::sync::Mutex<HashMap<String, crate::slack_models::Menu>>,
+ }
+ 
+ impl SlackAdapter {
+@@ -121,6 +183,107 @@
+             assistant_mode,
+             streaming,
+             streams: tokio::sync::Mutex::new(HashMap::new()),
++            model_owner: tokio::sync::OnceCell::new(),
++            model_menus: tokio::sync::Mutex::new(HashMap::new()),
++        }
++    }
++
++    async fn model_notice(&self, channel: &str, thread: &str, user: &str, text: &str) {
++        let _ = self.api_post("chat.postEphemeral", serde_json::json!({
++            "channel":channel,"thread_ts":thread,"user":user,"text":text,
++        })).await;
++    }
++
++    async fn show_model_menu(&self, router: &crate::adapter::AdapterRouter,
++        team: &str, channel: &str, thread: &str, user: &str) {
++        let Some(owner) = self.model_owner.get() else { return; };
++        if user != owner {
++            self.model_notice(channel, thread, user, "仅 owner 可以查看和切换此线程模型。").await;
++            return;
++        }
++        let key = format!("slack:{thread}");
++        if router.pool().get_or_create(&key, None).await.is_err() {
++            self.model_notice(channel, thread, user, "无法建立此线程的模型会话，请稍后重试。").await;
++            return;
++        }
++        let (session, options) = match router.pool().try_config_snapshot(&key).await {
++            Ok(Some(snapshot)) => snapshot,
++            Ok(None) => {
++                self.model_notice(channel, thread, user, "此线程正在处理请求。完成后请再次发送“模型”；当前模型未变更。").await;
++                return;
++            }
++            Err(_) => {
++                self.model_notice(channel, thread, user, "模型会话暂不可用，请重新发送“模型”。").await;
++                return;
++            }
++        };
++        let token = format!("openab-model-{}", uuid::Uuid::new_v4());
++        let Some(blocks) = crate::slack_models::blocks(&options, &token) else {
++            self.model_notice(channel, thread, user, "后端暂未提供可选模型列表，请稍后重试。").await;
++            return;
++        };
++        let resp = match self.api_post("chat.postMessage", serde_json::json!({
++            "channel":channel,"thread_ts":thread,"text":"此线程的模型选择（仅 owner 可操作）","blocks":blocks,
++        })).await {
++            Ok(resp) => resp,
++            Err(_) => { warn!("failed to post Slack model menu"); return; }
++        };
++        let Some(ts) = resp["ts"].as_str() else { return; };
++        let now = std::time::Instant::now();
++        let mut menus = self.model_menus.lock().await;
++        menus.retain(|_,menu|now.saturating_duration_since(menu.created) <= crate::slack_models::TTL);
++        if menus.len() >= 128 { if let Some(key) = menus.keys().next().cloned() { menus.remove(&key); } }
++        menus.insert(token, crate::slack_models::Menu {
++            team:team.to_string(),channel:channel.to_string(),thread:thread.to_string(),message:ts.to_string(),
++            session,owner:owner.clone(),options,created:now,
++        });
++    }
++
++    async fn handle_model_action(&self, router: &crate::adapter::AdapterRouter, payload: &serde_json::Value) {
++        let Some(token) = crate::slack_models::menu_token(payload) else { return; };
++        let user = payload["user"]["id"].as_str().unwrap_or("");
++        let channel = payload["channel"]["id"].as_str().unwrap_or("");
++        let thread = payload["message"]["thread_ts"].as_str().unwrap_or("");
++        // Unknown menus (including after restart) must never create a session or mutate state.
++        let mut menus = self.model_menus.lock().await;
++        let Some(menu) = menus.get(token).cloned() else {
++            drop(menus);
++            self.model_notice(channel,thread,user,"菜单已失效，请重新发送“模型”。").await;
++            return;
++        };
++        let selection = menu.selection(payload, std::time::Instant::now());
++        let (config_id, value) = match selection {
++            Ok(selection) => selection,
++            Err(message) => {
++                drop(menus);
++                self.model_notice(channel,thread,user,message).await;
++                return;
++            }
++        };
++        // Claim once before awaiting ACP. Replay cannot perform a second mutation.
++        menus.remove(token);
++        drop(menus);
++        let key = format!("slack:{}", menu.thread);
++        match router.pool().try_set_config_for_session(&key,&menu.session,&config_id,&value).await {
++            Ok(None) => {
++                self.model_menus.lock().await.insert(token.to_string(),menu.clone());
++                self.model_notice(&menu.channel,&menu.thread,user,"此线程正在处理请求，未切换模型。完成后可再次选择。").await;
++            }
++            Ok(Some(options)) => {
++                let actual = options.iter().find(|o|o.id == config_id).map(|o|o.current_value.as_str());
++                let text = if actual == Some(&value) {
++                    format!("✅ 此线程实际模型已切换为 {value}。下一轮使用此模型；其他线程保持原设置。")
++                } else {
++                    "后端未确认所选模型，不能确认切换成功。请重新发送“模型”检查当前值。".to_string()
++                };
++                let _ = self.api_post("chat.update",serde_json::json!({"channel":menu.channel,"ts":menu.message,
++                    "text":text,"blocks":[]})).await;
++                let _ = self.api_post("chat.postMessage",serde_json::json!({"channel":menu.channel,"thread_ts":menu.thread,"text":text})).await;
++                if actual == Some(&value) { info!(thread = %menu.thread, model = %value, "Slack thread model changed"); }
++            }
++            Err(_) => {
++                self.model_notice(&menu.channel,&menu.thread,user,"无法切换：会话或模型列表已变化。当前请求未重试，请重新发送“模型”。").await;
++            }
+         }
+     }
+ 
+@@ -747,6 +910,25 @@
+ /// `Ok` carries `get_socket_mode_url`'s own `anyhow::Result`.
+ type SocketModeUrlResult = std::result::Result<Result<String>, tokio::time::error::Elapsed>;
+ 
++/// Transport errors can contain handshake headers, URLs, or frame payloads.
++/// Log only the category, never data from the credential-bearing connection.
++fn socket_error_kind(error: &tungstenite::Error) -> &'static str {
++    match error {
++        tungstenite::Error::ConnectionClosed => "connection_closed",
++        tungstenite::Error::AlreadyClosed => "already_closed",
++        tungstenite::Error::Io(_) => "io",
++        tungstenite::Error::Tls(_) => "tls",
++        tungstenite::Error::Capacity(_) => "capacity",
++        tungstenite::Error::Protocol(_) => "protocol",
++        tungstenite::Error::WriteBufferFull(_) => "write_buffer_full",
++        tungstenite::Error::Utf8 => "utf8",
++        tungstenite::Error::AttackAttempt => "attack_attempt",
++        tungstenite::Error::Url(_) => "url",
++        tungstenite::Error::Http(_) => "http",
++        tungstenite::Error::HttpFormat(_) => "http_format",
++    }
++}
++
+ /// Next reconnect delay: double, capped. Reset to 1 on a successful connect.
+ fn next_backoff(cur: u64) -> u64 {
+     (cur * 2).min(MAX_BACKOFF_SECS)
+@@ -811,6 +993,7 @@
+     allowed_channels: HashSet<String>,
+     allowed_users: HashSet<String>,
+     allow_bot_messages: AllowBots,
++    model_selector_owner: Option<String>,
+     trusted_bot_ids: HashSet<String>,
+     allow_user_messages: AllowUsers,
+     max_bot_turns: u32,
+@@ -819,6 +1002,10 @@
+     dispatcher: Arc<crate::dispatch::Dispatcher>,
+     #[cfg(feature = "filestore")] filestore: Option<Arc<crate::filestore::Filestore>>,
+ ) -> Result<()> {
++    if let Some(owner) = model_selector_owner {
++        if !allow_all_users && allowed_users.contains(&owner) { let _ = adapter.model_owner.set(owner); }
++        else { warn!("Slack model selector owner must be an explicitly allowed human user; controls disabled"); }
++    }
+     let bot_token = adapter.bot_token().to_string();
+     let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
+     // Warm the bot-user-id cache once so the per-message path never does the
+@@ -856,7 +1043,7 @@
+                 continue;
+             }
+         };
+-        info!(url = %ws_url, "connecting to Slack Socket Mode");
++        info!("connecting to Slack Socket Mode");
+ 
+         match connect_with_reconnect_timeout(&ws_url).await {
+             Ok(Ok((ws_stream, _))) => {
+@@ -895,7 +1082,7 @@
+                                         {
+                                             Ok(Err(e)) => {
+                                                 warn!(
+-                                                    error = %e,
++                                                    error_kind = socket_error_kind(&e),
+                                                     "Slack Socket Mode envelope ack failed, reconnecting"
+                                                 );
+                                                 break;
+@@ -911,21 +1098,14 @@
+                                         }
+                                     }
+ 
+-                                    // Slash commands and interactive block_actions aren't
+-                                    // handled on Slack: slash commands are blocked by Slack
+-                                    // in thread composers, and the channel-level delivery
+-                                    // lacks the thread_ts needed to route to a session.
+-                                    // Ack only; ignore payload.
+-                                    match envelope["type"].as_str() {
+-                                        Some("slash_commands") | Some("interactive") => {
+-                                            debug!(
+-                                                envelope_type = envelope["type"].as_str().unwrap_or(""),
+-                                                "ignoring Slack envelope type (not supported on this adapter)"
+-                                            );
+-                                            continue;
+-                                        }
+-                                        _ => {}
++                                    // Ack was sent above, before asynchronous API/ACP work.
++                                    if envelope["type"].as_str() == Some("interactive") {
++                                        let payload = envelope["payload"].clone();
++                                        let adapter = adapter.clone(); let router = router.clone();
++                                        tokio::spawn(async move { adapter.handle_model_action(&router,&payload).await; });
++                                        continue;
+                                     }
++                                    if envelope["type"].as_str() == Some("slash_commands") { continue; }
+ 
+                                     // Route events
+                                     if envelope["type"].as_str() == Some("events_api") {
+@@ -936,23 +1116,21 @@
+                                                 // Apply bot gating for app_mention events (same rules as message events)
+                                                 let is_bot = event["bot_id"].is_string()
+                                                     || event["subtype"].as_str() == Some("bot_message");
+-                                                if is_bot {
+-                                                    match allow_bot_messages {
+-                                                        AllowBots::Off => { continue; }
+-                                                        AllowBots::Mentions | AllowBots::All => {
+-                                                            if !trusted_bot_ids.is_empty() {
+-                                                                let event_bot_id = event["bot_id"].as_str().unwrap_or("");
+-                                                                let is_trusted = adapter
+-                                                                    .trusted_bot_ids_contains(&trusted_bot_ids, event_bot_id)
+-                                                                    .await;
+-                                                                if !is_trusted {
+-                                                                    debug!(event_bot_id, "bot not in trusted_bot_ids, ignoring app_mention");
+-                                                                    continue;
+-                                                                }
+-                                                            }
+-                                                        }
+-                                                    }
++                                                // Bot mentions use message events so thread admission and
++                                                // loop limits always apply. Slack need not emit app_mention for bots.
++                                                if is_bot { continue; }
++                                                let channel_id = event["channel"].as_str().unwrap_or("");
++                                                let user_id = event["user"].as_str().unwrap_or("");
++                                                let bot_uid = adapter.get_bot_user_id().await;
++                                                let mentions_bot = bot_uid.is_some_and(|uid|
++                                                    text_mentions_uid(event["text"].as_str().unwrap_or(""), uid));
++                                                if bot_uid == Some(user_id)
++                                                    || !route_mention_via_app_event(false, is_dm_channel(channel_id), mentions_bot) {
++                                                    continue;
+                                                 }
++                                                let admitted = (allow_all_channels || allowed_channels.contains(channel_id))
++                                                    && (allow_all_users || allowed_users.contains(user_id));
++                                                reset_human_mention_turns(&mut *bot_turns.lock().await, event, admitted);
+                                                 let event = event.clone();
+                                                 let adapter = adapter.clone();
+                                                 let router = router.clone();
+@@ -999,9 +1177,7 @@
+                                                     .is_some_and(|bot_uid| text_mentions_uid(msg_text, bot_uid));
+                                                 let is_dm = channel_id.starts_with('D');
+                                                 let event_user_id = event["user"].as_str();
+-                                                let is_own_bot_msg = is_bot
+-                                                    && bot_uid_opt.as_deref().is_some()
+-                                                    && event_user_id == bot_uid_opt.as_deref();
++                                                let is_own_bot_msg = slack_is_own_sender(bot_uid_opt.as_deref(), event_user_id);
+ 
+                                                 debug!(
+                                                     channel_id,
+@@ -1010,7 +1186,6 @@
+                                                     is_dm,
+                                                     subtype,
+                                                     mentions_bot,
+-                                                    text = msg_text,
+                                                     "message event received"
+                                                 );
+ 
+@@ -1022,88 +1197,48 @@
+                                                 );
+                                                 if skip_subtype { continue; }
+ 
+-                                                // --- Eager multibot detection ---
+-                                                // Runs before self-check and bot gating so we always detect
+-                                                // other bots even when allow_bot_messages=Off filters them out.
+-                                                // Matches Discord #481 ordering.
+-                                                if is_bot && !is_own_bot_msg {
++                                                // Reject self and denied channels before any counter or warning.
++                                                if is_own_bot_msg { continue; }
++                                                if !allow_all_channels && !allowed_channels.contains(channel_id) {
++                                                    continue;
++                                                }
++                                                // Some bot_message events only carry a B... bot ID. Reuse
++                                                // the existing cached B-to-U lookup before counting or observing self.
++                                                if is_bot && event_user_id.is_none() {
++                                                    let resolved = adapter.resolve_bot_user_id(event["bot_id"].as_str().unwrap_or("")).await;
++                                                    if slack_is_own_sender(bot_uid_opt.as_deref(), resolved.as_deref()) {
++                                                        continue;
++                                                    }
++                                                }
++
++                                                // Preserve eager peer observation for MultibotMentions and
++                                                // streaming. Observation cannot increment turns or send warnings.
++                                                if is_bot {
+                                                     if let Some(thread_ts) = event["thread_ts"].as_str() {
+                                                         adapter.note_other_bot_in_thread(thread_ts).await;
+                                                     }
+                                                 }
+ 
+-                                                // --- Bot turn tracking ---
+-                                                // Runs before self-check so ALL bot messages (including own)
+-                                                // count toward the per-thread limit. Matches Discord #483.
+-                                                // Keyed on thread_ts when in a thread, else channel:ts.
+-                                                // Non-thread messages get a unique key per message, so the
+-                                                // counter never accumulates — intentional, because bot-to-bot
+-                                                // loops only happen inside threads.
+-                                                let turn_key = if let Some(thread_ts) = event["thread_ts"].as_str() {
+-                                                    thread_ts.to_string()
+-                                                } else {
+-                                                    format!("{}:{}", channel_id, event["ts"].as_str().unwrap_or(""))
+-                                                };
+-                                                // Classify under the lock (order-sensitive, kept in the read
+-                                                // loop), but run any warning send AFTER releasing it; holding
+-                                                // the tracker mutex across `chat.postMessage` would stall turn
+-                                                // tracking for every thread, not just this one.
+-                                                let turn_action = {
+-                                                    let mut tracker = bot_turns.lock().await;
+-                                                    if is_bot {
+-                                                        tracker.classify_bot_message(&turn_key)
+-                                                    } else {
+-                                                        if is_plain_user_message(subtype, msg_text) {
+-                                                            tracker.on_human_message(&turn_key);
+-                                                        }
+-                                                        TurnAction::Continue
+-                                                    }
+-                                                };
+-                                                match turn_action {
+-                                                    TurnAction::Continue => {}
+-                                                    TurnAction::SilentStop => continue,
+-                                                    TurnAction::WarnAndStop { severity, turns, user_message } => {
+-                                                        match severity {
+-                                                            TurnSeverity::Hard => warn!(channel_id, turns, "hard bot turn limit reached"),
+-                                                            TurnSeverity::Soft => info!(channel_id, turns, max = max_bot_turns, "soft bot turn limit reached"),
+-                                                        }
+-                                                        let channel_allowed = allow_all_channels
+-                                                            || allowed_channels.contains(channel_id);
+-                                                        if !is_own_bot_msg && channel_allowed {
+-                                                            let warn_channel = ChannelRef {
+-                                                                platform: "slack".into(),
+-                                                                channel_id: channel_id.to_string(),
+-                                                                thread_id: event["thread_ts"].as_str().map(|s| s.to_string()),
+-                                                                parent_id: None,
+-                                                                origin_event_id: None,
+-                                                            };
+-                                                            let adapter = adapter.clone();
+-                                                            tokio::spawn(async move {
+-                                                                if let Err(e) = adapter.send_message(&warn_channel, &user_message).await {
+-                                                                    warn!(error = %e, "failed to send bot turn limit warning");
+-                                                                }
+-                                                            });
+-                                                        }
+-                                                        continue;
+-                                                    }
+-                                                }
+-
+-                                                // Ignore own bot messages (after counting toward turns)
+-                                                if is_own_bot_msg { continue; }
+-
+-                                                // Skip messages that @mention the bot — app_mention handles those
+-                                                // (except in DMs where app_mention doesn't fire)
+-                                                if mentions_bot && !is_dm { continue; }
+-
+                                                 // --- Bot message gating ---
+                                                 if is_bot {
+                                                     let event_bot_id = event["bot_id"].as_str().unwrap_or("");
++                                                    info!(channel_id, event_bot_id, has_thread, mentions_bot, "Slack bot message observed");
++                                                    if !slack_bot_has_trigger(allow_bot_messages, is_dm, has_thread, mentions_bot) {
++                                                        continue;
++                                                    }
++                                                    // Trust must precede both turn-limit mechanisms, so an
++                                                    // unadmitted bot can never consume turns or cause a warning.
++                                                    if !trusted_bot_ids.is_empty() {
++                                                        let is_trusted = adapter
++                                                            .trusted_bot_ids_contains(&trusted_bot_ids, event_bot_id)
++                                                            .await;
++                                                        if !is_trusted {
++                                                            info!(event_bot_id, "Slack bot message filtered: bot not trusted");
++                                                            continue;
++                                                        }
++                                                    }
+                                                     match allow_bot_messages {
+-                                                        AllowBots::Off => { continue; }
+-                                                        AllowBots::Mentions => {
+-                                                            if !mentions_bot { continue; }
+-                                                        }
+-                                                        AllowBots::All => {
++                                                        AllowBots::All if slack_history_cap_enabled(allow_bot_messages, max_bot_turns) => {
+                                                             // Loop protection: count consecutive bot msgs (fail-closed)
+                                                             if let Some(thread_ts) = event["thread_ts"].as_str() {
+                                                                 let cap = MAX_CONSECUTIVE_BOT_TURNS;
+@@ -1138,29 +1273,83 @@
+                                                                 }
+                                                             }
+                                                         }
++                                                        AllowBots::Off | AllowBots::Mentions | AllowBots::All => {}
+                                                     }
+-                                                    // Check trusted_bot_ids
+-                                                    if !trusted_bot_ids.is_empty() {
+-                                                        let is_trusted = adapter
+-                                                            .trusted_bot_ids_contains(&trusted_bot_ids, event_bot_id)
+-                                                            .await;
+-                                                        if !is_trusted {
+-                                                            debug!(event_bot_id, "bot not in trusted_bot_ids, ignoring");
+-                                                            continue;
++                                                }
++
++                                                // Skip messages that @mention the bot — app_mention handles those
++                                                // (except in DMs where app_mention doesn't fire)
++                                                if route_mention_via_app_event(is_bot, is_dm, mentions_bot) { continue; }
++
++                                                // --- Bot turn tracking ---
++                                                // Slack ignores self events before incrementing. Zero bypasses
++                                                // both shared counters; positive limits still use the tracker.
++                                                // Keyed on thread_ts when in a thread, else channel:ts.
++                                                // Non-thread messages get a unique key per message, so the
++                                                // counter never accumulates — intentional, because bot-to-bot
++                                                // loops only happen inside threads.
++                                                let turn_key = if let Some(thread_ts) = event["thread_ts"].as_str() {
++                                                    thread_ts.to_string()
++                                                } else {
++                                                    format!("{}:{}", channel_id, event["ts"].as_str().unwrap_or(""))
++                                                };
++                                                // Classify under the lock (order-sensitive, kept in the read
++                                                // loop), but run any warning send AFTER releasing it; holding
++                                                // the tracker mutex across `chat.postMessage` would stall turn
++                                                // tracking for every thread, not just this one.
++                                                let turn_action = {
++                                                    let mut tracker = bot_turns.lock().await;
++                                                    if is_bot {
++                                                        classify_slack_bot_turn(&mut tracker, max_bot_turns, &turn_key, is_own_bot_msg)
++                                                    } else {
++                                                        if (allow_all_users || allowed_users.contains(event_user_id.unwrap_or("")))
++                                                            && is_plain_user_message(subtype, msg_text) {
++                                                            tracker.on_human_message(&turn_key);
+                                                         }
++                                                        TurnAction::Continue
+                                                     }
+-                                                    // Bot messages must be in a thread (no top-level bot processing)
+-                                                    if !has_thread { continue; }
++                                                };
++                                                match turn_action {
++                                                    TurnAction::Continue => {}
++                                                    TurnAction::SilentStop => continue,
++                                                    TurnAction::WarnAndStop { severity, turns, user_message } => {
++                                                        match severity {
++                                                            TurnSeverity::Hard => warn!(channel_id, turns, "hard bot turn limit reached"),
++                                                            TurnSeverity::Soft => info!(channel_id, turns, max = max_bot_turns, "soft bot turn limit reached"),
++                                                        }
++                                                        let channel_allowed = allow_all_channels
++                                                            || allowed_channels.contains(channel_id);
++                                                        if !is_own_bot_msg && channel_allowed {
++                                                            let warn_channel = ChannelRef {
++                                                                platform: "slack".into(),
++                                                                channel_id: channel_id.to_string(),
++                                                                thread_id: event["thread_ts"].as_str().or_else(|| event["ts"].as_str()).map(|s| s.to_string()),
++                                                                parent_id: None,
++                                                                origin_event_id: None,
++                                                            };
++                                                            let adapter = adapter.clone();
++                                                            tokio::spawn(async move {
++                                                                if let Err(e) = adapter.send_message(&warn_channel, &user_message).await {
++                                                                    warn!(error = %e, "failed to send bot turn limit warning");
++                                                                }
++                                                            });
++                                                        }
++                                                        continue;
++                                                    }
+                                                 }
+ 
+                                                 // --- User message gating ---
+                                                 if !is_bot {
+                                                     if is_dm {
+-                                                        // DM: implicit mention — always process
++                                                        if !slack_dm_has_trigger(allow_user_messages, mentions_bot) {
++                                                            continue;
++                                                        }
+                                                     } else {
+                                                         match allow_user_messages {
+                                                             AllowUsers::Mentions => {
+-                                                                if !mentions_bot { continue; }
++                                                                if !route_mention_via_message_event(false, is_dm, mentions_bot) {
++                                                                    continue;
++                                                                }
+                                                             }
+                                                             AllowUsers::Involved => {
+                                                                 if !has_thread {
+@@ -1252,7 +1441,7 @@
+                                     {
+                                         Ok(Err(e)) => {
+                                             warn!(
+-                                                error = %e,
++                                                error_kind = socket_error_kind(&e),
+                                                 "Slack Socket Mode pong send failed, reconnecting"
+                                             );
+                                             break;
+@@ -1272,7 +1461,7 @@
+                                     break;
+                                 }
+                                 Err(e) => {
+-                                    error!("Socket Mode read error: {e}");
++                                    error!(error_kind = socket_error_kind(&e), "Socket Mode read error");
+                                     break;
+                                 }
+                                 _ => {}
+@@ -1291,7 +1480,7 @@
+                             }
+                             match send_with_timeout(&mut write, tungstenite::Message::Ping(Vec::new())).await {
+                                 Ok(Err(e)) => {
+-                                    warn!(error = %e, "Slack Socket Mode ping failed, reconnecting");
++                                    warn!(error_kind = socket_error_kind(&e), "Slack Socket Mode ping failed, reconnecting");
+                                     break;
+                                 }
+                                 Err(_) => {
+@@ -1313,7 +1502,7 @@
+                 }
+             }
+             Ok(Err(e)) => {
+-                error!(err = %e, backoff = backoff_secs, "failed to connect to Slack Socket Mode, retrying");
++                error!(error_kind = socket_error_kind(&e), backoff = backoff_secs, "failed to connect to Slack Socket Mode, retrying");
+             }
+             Err(_) => {
+                 error!(
+@@ -1487,6 +1676,12 @@
+     // Process file attachments (images, audio)
+     let files = event["files"].as_array();
+     let has_files = files.is_some_and(|f| !f.is_empty());
++    if prompt.trim() == "模型" && !has_files && !is_bot_msg && adapter.model_owner.get().is_some() {
++        let thread = thread_ts.as_deref().unwrap_or(&ts);
++        adapter.show_model_menu(router,team_id,&channel_id,thread,&user_id).await;
++        return;
++    }
++
+ 
+     if prompt.is_empty() && !has_files {
+         return;
+@@ -1682,6 +1877,10 @@
+                         warn!(filename, %status, "image download denied");
+                         failed_image_files.push(filename.to_string());
+                     }
++                    Err(media::MediaFetchError::Network(e)) => {
++                        warn!(filename, error_kind = media::download_error_kind(&e), "image download failed");
++                        failed_image_files.push(filename.to_string());
++                    }
+                     Err(e) => {
+                         warn!(filename, error = %e, "image download failed");
+                         failed_image_files.push(filename.to_string());
+@@ -1891,8 +2090,12 @@
+ /// misses it.
+ fn text_mentions_uid(text: &str, uid: &str) -> bool {
+     let prefix = format!("<@{uid}");
+-    text.match_indices(&prefix)
+-        .any(|(i, _)| matches!(text.as_bytes().get(i + prefix.len()), Some(b'>') | Some(b'|')))
++    text.match_indices(&prefix).any(|(i, _)| {
++        let suffix = &text[i + prefix.len()..];
++        suffix.starts_with('>')
++            || suffix.strip_prefix('|').and_then(|label| label.split_once('>'))
++                .is_some_and(|(label, _)| !label.chars().any(|c| matches!(c, '<' | '\n' | '\r')))
++    })
+ }
+ 
+ fn bot_id_matches_trusted(
+@@ -2090,12 +2293,159 @@
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn slack_zero_turn_limit_bypasses_soft_hard_limits_and_does_not_count() {
++        let mut zero_tracker = BotTurnTracker::new(0);
++        let mut positive_tracker = BotTurnTracker::new(2);
++        for _ in 0..=crate::bot_turns::HARD_BOT_TURN_LIMIT + 1000 {
++            assert_eq!(classify_slack_bot_turn(&mut zero_tracker, 0, "root", false), TurnAction::Continue);
++            assert_eq!(classify_slack_bot_turn(&mut positive_tracker, 0, "root", false), TurnAction::Continue);
++        }
++        // Even the positive tracker remains untouched while Slack's zero bypass is active.
++        assert_eq!(classify_slack_bot_turn(&mut positive_tracker, 2, "root", false), TurnAction::Continue);
++    }
++
++    #[test]
++    fn slack_self_bot_is_ignored_before_counting_at_zero_and_positive_limits() {
++        for limit in [0, 2] {
++            let mut tracker = BotTurnTracker::new(2);
++            for _ in 0..=crate::bot_turns::HARD_BOT_TURN_LIMIT {
++                assert_eq!(classify_slack_bot_turn(&mut tracker, limit, "root", true), TurnAction::SilentStop);
++            }
++            assert_eq!(classify_slack_bot_turn(&mut tracker, 2, "root", false), TurnAction::Continue);
++        }
++    }
++
++    #[test]
++    fn slack_self_identity_accepts_user_or_resolved_bot_uid_but_not_missing_ids() {
++        assert!(slack_is_own_sender(Some("SELF"), Some("SELF")));
++        // The event.user and bots.info fallback both enter this same comparison.
++        assert!(!slack_is_own_sender(Some("SELF"), Some("OTHER")));
++        assert!(!slack_is_own_sender(Some("SELF"), None));
++        assert!(!slack_is_own_sender(None, None));
++        assert!(!slack_is_own_sender(Some(""), Some("")));
++    }
++
++    #[test]
++    fn slack_positive_turn_limits_still_warn_once_stop_and_reset() {
++        let mut tracker = BotTurnTracker::new(2);
++        assert_eq!(classify_slack_bot_turn(&mut tracker, 2, "root", false), TurnAction::Continue);
++        assert!(matches!(classify_slack_bot_turn(&mut tracker, 2, "root", false),
++            TurnAction::WarnAndStop { severity: TurnSeverity::Soft, turns: 2, .. }));
++        assert_eq!(classify_slack_bot_turn(&mut tracker, 2, "root", false), TurnAction::SilentStop);
++        tracker.on_human_message("root");
++        assert_eq!(classify_slack_bot_turn(&mut tracker, 2, "root", false), TurnAction::Continue);
++
++        let limit = crate::bot_turns::HARD_BOT_TURN_LIMIT + 1;
++        let mut tracker = BotTurnTracker::new(limit);
++        for _ in 1..crate::bot_turns::HARD_BOT_TURN_LIMIT {
++            assert_eq!(classify_slack_bot_turn(&mut tracker, limit, "root", false), TurnAction::Continue);
++        }
++        assert!(matches!(classify_slack_bot_turn(&mut tracker, limit, "root", false),
++            TurnAction::WarnAndStop { severity: TurnSeverity::Hard, .. }));
++        assert_eq!(classify_slack_bot_turn(&mut tracker, limit, "root", false), TurnAction::SilentStop);
++    }
++
++    #[test]
++    fn slack_zero_also_disables_legacy_all_mode_history_cap() {
++        for mode in [AllowBots::Off, AllowBots::Mentions, AllowBots::All] {
++            assert!(!slack_history_cap_enabled(mode, 0));
++            assert_eq!(slack_history_cap_enabled(mode, 1), mode == AllowBots::All);
++        }
++    }
++
++    #[test]
++    fn slack_other_bot_mentions_do_not_consume_turns_or_produce_limit_warnings() {
++        let mut tracker = BotTurnTracker::new(2);
++        // Regression: two Muse messages in one thread only mention Muse, not this bot.
++        for text in ["<@MUSE> first reply", "<@MUSE> second reply"] {
++            let mentions = text_mentions_uid(text, "ANTIGRAVITY");
++            let admitted = slack_bot_has_trigger(AllowBots::Mentions, false, true, mentions);
++            assert!(!admitted);
++            let action = if admitted {
++                classify_slack_bot_turn(&mut tracker, 2, "muse-thread", false)
++            } else {
++                TurnAction::SilentStop
++            };
++            assert_eq!(action, TurnAction::SilentStop);
++        }
++        // The first actual mention is still the first counted turn, not a warning.
++        assert_eq!(classify_slack_bot_turn(&mut tracker, 2, "muse-thread", false), TurnAction::Continue);
++    }
++
++    #[test]
++    fn slack_mentions_route_exactly_once_for_humans_bots_roots_threads_and_dms() {
++        for is_bot in [false, true] {
++            for has_thread in [false, true] {
++                for is_dm in [false, true] {
++                    for mentions in [false, true] {
++                        let app = route_mention_via_app_event(is_bot, is_dm, mentions);
++                        let message = route_mention_via_message_event(is_bot, is_dm, mentions);
++                        assert_eq!(usize::from(app) + usize::from(message), usize::from(mentions));
++                        assert_eq!(app, mentions && !is_bot && !is_dm);
++                        if is_bot {
++                            assert_eq!(slack_bot_has_trigger(AllowBots::Mentions, is_dm, has_thread, mentions), mentions);
++                            assert!(!slack_bot_has_trigger(AllowBots::Off, is_dm, has_thread, mentions));
++                        }
++                        if is_bot && message {
++                            assert!(slack_bot_has_target(has_thread, mentions));
++                        }
++                        if !is_bot && is_dm {
++                            assert_eq!(slack_dm_has_trigger(AllowUsers::Mentions, mentions), mentions);
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn slack_bot_root_requires_mention_and_other_dm_modes_keep_their_behavior() {
++        assert!(!slack_bot_has_target(false, false));
++        assert!(slack_bot_has_target(false, true));
++        assert!(slack_bot_has_target(true, false));
++        for mode in [AllowUsers::Involved, AllowUsers::MultibotMentions] {
++            assert!(slack_dm_has_trigger(mode, false));
++            assert!(slack_dm_has_trigger(mode, true));
++        }
++    }
++
++    #[test]
++    fn slack_trigger_requires_a_complete_wire_mention_for_this_bot() {
++        for text in ["@Antigravity hello", "<@OTHER> hello", "<@SELF", "<@SELF|label", "&lt;@SELF&gt;",
++            "<@SELF|label<@OTHER>", "<@SELF|label\n>", "<@SELF|label\r>"] {
++            assert!(!text_mentions_uid(text, "SELF"), "unexpected trigger: {text}");
++        }
++        assert!(text_mentions_uid("<@SELF> hello", "SELF"));
++        assert!(text_mentions_uid("<@SELF|Antigravity> hello", "SELF"));
++    }
++
+     // --- trust gate tests ---
+ 
+     /// Pins the L3 bot-bypass: the shared identity gate must not run for bot
+     /// senders (bot admission = allow_bot_messages + trusted_bot_ids), matching
+     /// the inline user check's `!is_bot_msg` bypass. Regression for #1361
+     /// (mirrors the Discord test for PR #1270 review F4).
++    #[test]
++    fn admitted_human_mentions_reset_bot_cap_but_denied_senders_do_not() {
++        let mut tracker = BotTurnTracker::new(2);
++        let event=serde_json::json!({"channel":"C","thread_ts":"root","ts":"message"});
++        assert_eq!(tracker.classify_bot_message("root"), TurnAction::Continue);
++        assert!(matches!(tracker.classify_bot_message("root"),TurnAction::WarnAndStop{..}));
++        reset_human_mention_turns(&mut tracker,&event,false);
++        assert_eq!(tracker.classify_bot_message("root"),TurnAction::SilentStop);
++        reset_human_mention_turns(&mut tracker,&event,true);
++        assert_eq!(tracker.classify_bot_message("root"),TurnAction::Continue);
++    }
++
++    #[test]
++    fn bot_mentions_reach_message_gates_while_human_mentions_are_deduplicated() {
++        assert!(!route_mention_via_app_event(true,false,true));
++        assert!(route_mention_via_app_event(false,false,true));
++        assert!(!route_mention_via_app_event(false,true,true));
++        assert!(!route_mention_via_app_event(true,false,false));
++    }
++
+     #[test]
+     fn l3_gate_skips_bots_applies_to_humans() {
+         assert!(!l3_gate_applies(true)); // bot → gate skipped
+@@ -2607,9 +2957,28 @@
+ mod socket_keepalive_tests {
+     use super::{
+         connect_with_reconnect_timeout, get_socket_mode_url_with_timeout, next_backoff,
+-        socket_idle, wait_backoff_or_shutdown, IDLE_TIMEOUT_SECS, MAX_BACKOFF_SECS,
++        socket_error_kind, socket_idle, wait_backoff_or_shutdown, IDLE_TIMEOUT_SECS, MAX_BACKOFF_SECS,
+     };
+     use std::time::Duration;
++
++    #[test]
++    fn socket_errors_hide_headers_payloads_and_io_details() {
++        use super::tungstenite;
++        let secret = "wss://example.invalid/socket?ticket=secret xapp-test-secret";
++        let response = tungstenite::http::Response::builder()
++            .status(403)
++            .header("location", secret)
++            .body(Some(secret.as_bytes().to_vec()))
++            .unwrap();
++        let cases = [
++            (tungstenite::Error::Http(response), "http"),
++            (tungstenite::Error::WriteBufferFull(tungstenite::Message::Text(secret.into())), "write_buffer_full"),
++            (tungstenite::Error::Io(std::io::Error::new(std::io::ErrorKind::Other, secret)), "io"),
++        ];
++        for (error, expected) in cases {
++            assert_eq!(socket_error_kind(&error), expected);
++        }
++    }
+ 
+     /// Backoff doubles and caps, matching the gateway adapter (1,2,4,8,16,30,30…).
+     #[test]
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1058,6 +1058,7 @@
+                 slack_cfg.allowed_channels.into_iter().collect(),
+                 slack_allowed_users,
+                 slack_cfg.allow_bot_messages,
++                slack_cfg.model_selector_owner,
+                 slack_cfg.trusted_bot_ids.into_iter().collect(),
+                 slack_cfg.allow_user_messages,
+                 max_bot_turns,
+--- /dev/null
++++ b/crates/openab-core/src/slack_models.rs
+@@ -0,0 +1,81 @@
++//! Thread-bound Slack controls backed by ACP configOptions, never model prompts.
++use crate::acp::protocol::ConfigOption;
++use serde_json::{json, Value};
++use std::time::{Duration, Instant};
++
++pub const ACTION: &str = "openab_model_select";
++pub const TTL: Duration = Duration::from_secs(15 * 60);
++#[derive(Clone)]
++pub struct Menu {
++    pub team: String,
++    pub channel: String,
++    pub thread: String,
++    pub message: String,
++    pub session: String,
++    pub owner: String,
++    pub options: Vec<ConfigOption>,
++    pub created: Instant,
++}
++impl Menu {
++    pub fn selection(&self, payload: &Value, now: Instant) -> Result<(String, String), &'static str> {
++        if now.saturating_duration_since(self.created) > TTL { return Err("菜单已过期，请重新发送“模型”。"); }
++        if payload["user"]["id"].as_str() != Some(&self.owner) { return Err("仅 owner 可以切换模型。"); }
++        if payload["team"]["id"].as_str() != Some(&self.team)
++            || payload["channel"]["id"].as_str() != Some(&self.channel)
++            || payload["message"]["thread_ts"].as_str() != Some(&self.thread)
++            || payload["container"]["message_ts"].as_str() != Some(&self.message)
++            || payload["message"]["ts"].as_str() != Some(&self.message) {
++            return Err("菜单不属于当前线程，请重新发送“模型”。");
++        }
++        let actions = payload["actions"].as_array().ok_or("无效模型选择。")?;
++        if actions.len() != 1 || actions[0]["action_id"] != ACTION { return Err("无效模型选择。"); }
++        let selected = actions[0]["selected_option"]["value"].as_str().ok_or("无效模型选择。")?;
++        for opt in &self.options {
++            if opt.category.as_deref() == Some("model") && opt.options.iter().any(|v| v.value == selected) {
++                return Ok((opt.id.clone(), selected.to_string()));
++            }
++        }
++        Err("该模型不在此菜单的后端列表中，请重新发送“模型”。")
++    }
++}
++pub fn blocks(options: &[ConfigOption], token: &str) -> Option<Vec<Value>> {
++    let models: Vec<_> = options.iter().filter(|o| o.category.as_deref() == Some("model") && o.option_type == "select").collect();
++    let current = models.iter().map(|o| o.current_value.as_str()).collect::<Vec<_>>().join("、");
++    let mut blocks = vec![json!({"type":"section","text":{"type":"plain_text","text":format!("当前模型：{current}\n仅 owner 可选择；只影响此线程，下一轮使用所选模型。")}})];
++    let mut count = 0;
++    for opt in models {
++        let choices: Vec<Value> = opt.options.iter().filter(|v| !v.value.is_empty() && v.value.len() <= 150)
++            .map(|v|json!({"text":{"type":"plain_text","text":v.name.chars().take(75).collect::<String>()},"value":v.value})).collect();
++        for chunk in choices.chunks(100) {
++            // Slack allows at most 50 blocks per message. No silently hidden rows.
++            if blocks.len() >= 49 { return None; }
++            let mut select = json!({"type":"static_select","action_id":ACTION,"placeholder":{"type":"plain_text","text":"选择此线程的模型"},"options":chunk});
++            if let Some(current) = chunk.iter().find(|v| v["value"].as_str() == Some(&opt.current_value)) { select["initial_option"] = current.clone(); }
++            blocks.push(json!({"type":"actions","block_id":format!("{token}:{count}"),"elements":[select]}));
++            count += 1;
++        }
++    }
++    if count == 0 { None } else { Some(blocks) }
++}
++pub fn menu_token(payload: &Value) -> Option<&str> {
++    let actions = payload["actions"].as_array()?;
++    if payload["type"] != "block_actions" || actions.len()!=1 || actions[0]["action_id"] != ACTION { return None; }
++    let id=actions[0]["block_id"].as_str()?;
++    id.split_once(':').map(|(token,_)|token).filter(|token|token.starts_with("openab-model-"))
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::acp::protocol::ConfigOptionValue;
++    fn option() -> ConfigOption { ConfigOption{id:"model".into(),name:"Model".into(),description:None,category:Some("model".into()),option_type:"select".into(),current_value:"m1".into(),options:vec![ConfigOptionValue{value:"m1".into(),name:"Backend One".into(),description:None},ConfigOptionValue{value:"m2".into(),name:"Backend Two".into(),description:None}]} }
++    fn menu() -> Menu {Menu{team:"T".into(),channel:"C".into(),thread:"root".into(),message:"menu".into(),session:"session".into(),owner:"owner".into(),options:vec![option()],created:Instant::now()}}
++    fn payload() -> Value {json!({"type":"block_actions","team":{"id":"T"},"channel":{"id":"C"},"user":{"id":"owner"},"message":{"ts":"menu","thread_ts":"root"},"container":{"message_ts":"menu"},"actions":[{"action_id":ACTION,"block_id":"openab-model-token:0","selected_option":{"value":"m2"}}]})}
++    #[test] fn owner_selection_uses_real_backend_value(){assert_eq!(menu().selection(&payload(),Instant::now()).unwrap(),("model".into(),"m2".into()));}
++    #[test] fn non_owner_cannot_switch(){let mut p=payload();p["user"]["id"]=json!("Milo");assert!(menu().selection(&p,Instant::now()).is_err());}
++    #[test] fn menu_rejects_other_channel_thread_team_and_message(){for path in [("channel","id"),("team","id"),("message","thread_ts"),("message","ts"),("container","message_ts")] {let mut p=payload();p[path.0][path.1]=json!("other");assert!(menu().selection(&p,Instant::now()).is_err());}}
++    #[test] fn expired_menu_cannot_switch(){let m=menu();assert!(m.selection(&payload(),m.created+TTL+Duration::from_secs(1)).is_err());}
++    #[test] fn arbitrary_and_multiple_values_rejected(){let mut p=payload();p["actions"][0]["selected_option"]["value"]=json!("invented");assert!(menu().selection(&p,Instant::now()).is_err());p["actions"].as_array_mut().unwrap().push(json!({}));assert!(menu_token(&p).is_none());}
++    #[test] fn menu_contains_current_model_and_dropdown(){let b=blocks(&[option()],"token").unwrap();assert!(b[0]["text"]["text"].as_str().unwrap().contains("m1"));assert_eq!(b[1]["elements"][0]["initial_option"]["value"],"m1");assert_eq!(b[1]["elements"][0]["options"][1]["value"],"m2");}
++    #[test] fn empty_backend_list_has_no_fabricated_menu(){assert!(blocks(&[],"token").is_none());}
++    #[test] fn large_lists_split_into_slack_sized_selects(){let mut o=option();o.options=(0..101).map(|i|ConfigOptionValue{value:format!("m{i}"),name:format!("Model {i}"),description:None}).collect();let b=blocks(&[o],"token").unwrap();assert_eq!(b.len(),3);assert_eq!(b[1]["elements"][0]["options"].as_array().unwrap().len(),100);}
++}

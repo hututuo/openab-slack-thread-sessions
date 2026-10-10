@@ -1,0 +1,61 @@
+{
+  "upstream_repository": "https://github.com/openabdev/openab",
+  "upstream_commit": "6431a1b6991673429f344acb78a58d94658d30fb",
+  "files": [
+    {
+      "path": "crates/openab-core/src/acp/pool.rs",
+      "upstream_sha256": "ba9d5798d70e53925dd7ccda0513998bebe63f2efac915e34b15f022aba74b25",
+      "patched_sha256": "999fb1c460484d6b75984da88671498de9028e17f0363dc139612441a7dd981e"
+    },
+    {
+      "path": "crates/openab-core/src/adapter.rs",
+      "upstream_sha256": "2ad27d281abb50841bb5e0f2ca8bbc44c1943badd0400a8c9ddd845cbfffbd97",
+      "patched_sha256": "c2ac78dee361a26b69f5351d4127cc404faa7d58d45a6aa074812f982eace415"
+    },
+    {
+      "path": "crates/openab-core/src/config.rs",
+      "upstream_sha256": "c61e0a3b44cc9a4b46598c7996a570739ffb4efee7265eefe1c3b6c4fbd03aa5",
+      "patched_sha256": "9bb3ac81f57df9969e85074e32704c4a35ca3fd736c7154b893b988565c563c6"
+    },
+    {
+      "path": "crates/openab-core/src/cron.rs",
+      "upstream_sha256": "bf27ab9c04d0db80790cf43b3cf0b4967d933b882437f09519f375340442e051",
+      "patched_sha256": "9fcae357e611b930e4c00f57f940b12f47a5294157010b77bdc47a1fe9b4991b"
+    },
+    {
+      "path": "crates/openab-core/src/dispatch.rs",
+      "upstream_sha256": "e9e983d8d4e435b17008ee9cade21a44948ab93c2e86efe19a247702589798fb",
+      "patched_sha256": "efe336c2360635f054f199592e5df12c4cb80a04f19cca04996999535434e727"
+    },
+    {
+      "path": "crates/openab-core/src/lib.rs",
+      "upstream_sha256": "199bf1fec61fbfded34c41b7dd5a781eb42b40b02ee1b8d1a254137ebfa1749e",
+      "patched_sha256": "e82909ddc916233f21a48350f2730055ec709f8236eac9264ab4252f5842e674"
+    },
+    {
+      "path": "crates/openab-core/src/media.rs",
+      "upstream_sha256": "8b38c36be83e00ee30762d929d4ad3dc65a809699080505a8336f135a6386dbe",
+      "patched_sha256": "10caaaec74654b1d823995063a2fcc63164b635d82bb783557cc3f85d82a7f2b"
+    },
+    {
+      "path": "crates/openab-core/src/secrets.rs",
+      "upstream_sha256": "b6f8a53d082a3fcaab9bac7db233b18bc214d505d3d8ed23cfd20c4b7ce89149",
+      "patched_sha256": "0cd65840012581b0577400d7a80311205275a41c769862b94642cd9eb45da707"
+    },
+    {
+      "path": "crates/openab-core/src/slack.rs",
+      "upstream_sha256": "c94b9f442ba9515d959d5c16e2d369368ee79884e5c2821ec08ecf4a5715ab1b",
+      "patched_sha256": "87753ca42de932b6e249c77ac4e77208ad665db5c018874759ae71140fdd65a8"
+    },
+    {
+      "path": "crates/openab-core/src/slack_models.rs",
+      "upstream_sha256": null,
+      "patched_sha256": "21d4a7e85738e2464ba99538e5819d17165cdef3be09e26bc38265fc836aa64d"
+    },
+    {
+      "path": "src/main.rs",
+      "upstream_sha256": "c84659e85e84603c24f3407cfbfc86b5e3737c1d6c59aba1291df943a2291cd3",
+      "patched_sha256": "0ab2c333a06d50c20c0acae4e8483997061af17ab7eeef8b39be41065fc76106"
+    }
+  ]
+}

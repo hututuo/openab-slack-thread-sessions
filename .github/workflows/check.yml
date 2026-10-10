@@ -1,0 +1,19 @@
+name: Verify patch reconstruction
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  patch-and-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python migration tests
+        run: python3 -m unittest discover -s tools -v
+      - name: Get fixed upstream source
+        run: |
+          git clone --filter=blob:none https://github.com/openabdev/openab.git "$RUNNER_TEMP/openab"
+          git -C "$RUNNER_TEMP/openab" checkout --detach 6431a1b6991673429f344acb78a58d94658d30fb
+      - name: Reconstruct and verify changed source
+        run: python3 tools/apply_patches.py "$RUNNER_TEMP/openab" --apply

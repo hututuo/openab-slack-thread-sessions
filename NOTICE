@@ -1,0 +1,15 @@
+This repository contains modifications derived from OpenAB:
+https://github.com/openabdev/openab
+Upstream commit: 6431a1b6991673429f344acb78a58d94658d30fb
+
+OpenAB copyright: Copyright (c) 2026 openabdev
+License: MIT (full upstream notice retained in LICENSE).
+
+This is an independent patch distribution, not an official OpenAB release.
+The upstream transport, harness, agent integration and pre-existing source remain
+credited to their upstream authors. New patch-project code and documentation
+are distributed under the same MIT license. No claim of wholly original
+implementation or endorsement by OpenAB, Slack, Google or Antigravity is made.
+
+Third-party packages are not vendored here. An upstream checkout retains its
+own dependency manifests, lockfile, notices and respective licenses.

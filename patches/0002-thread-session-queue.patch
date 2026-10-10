@@ -1,0 +1,1537 @@
+--- a/crates/openab-core/src/acp/pool.rs
++++ b/crates/openab-core/src/acp/pool.rs
+@@ -5,7 +5,7 @@
+ use std::collections::HashMap;
+ use std::path::{Path, PathBuf};
+ use std::sync::Arc;
+-use tokio::sync::{Mutex, RwLock};
++use tokio::sync::{Mutex, RwLock, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
+ use tokio::time::Instant;
+ use tracing::{info, warn};
+ 
+@@ -55,11 +55,16 @@
+ 
+ pub struct SessionPool {
+     state: RwLock<PoolState>,
++    /// FIFO execution admission, held from before creation through the final turn reply.
++    turns: TurnAdmission,
++    /// Serialize connection creation/eviction, never ongoing prompt execution.
++    allocation: Mutex<()>,
+     config: AgentConfig,
+     max_sessions: usize,
+     /// Force-evict sessions stuck in-flight longer than this threshold
+     /// (`prompt_hard_timeout_secs + hung_grace_secs`, wired in main.rs).
+     hung_threshold_secs: u64,
++    storage_error: Option<String>,
+     mapping_path: PathBuf,
+     meta_path: PathBuf,
+     default_config_options: HashMap<String, String>,
+@@ -67,6 +72,84 @@
+     session_registrar: Option<Arc<dyn crate::acp_mcp::SessionTokenRegistrar>>,
+     #[cfg(feature = "acp-mcp")]
+     facade_url: Option<String>,
++}
++
++/// A reservation pins this thread's connection between ensure_session and prompt.
++/// Drop (including cancellation/error unwinding) releases both scopes.
++pub struct SessionTurn {
++    key: String,
++    pinned: Arc<std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
++    cancelled: tokio::sync::watch::Receiver<bool>,
++    _capacity: OwnedSemaphorePermit,
++    _thread: OwnedMutexGuard<()>,
++}
++
++impl SessionTurn {
++    /// Hung-session recovery signals the exact reservation after process teardown.
++    /// The caller drops its prompt future before releasing this reservation.
++    pub async fn cancelled(&mut self) {
++        loop {
++            if *self.cancelled.borrow_and_update() { return; }
++            if self.cancelled.changed().await.is_err() { return; }
++        }
++    }
++}
++
++impl Drop for SessionTurn {
++    fn drop(&mut self) {
++        self.pinned.lock().unwrap().remove(&self.key);
++    }
++}
++
++struct TurnAdmission {
++    gates: std::sync::Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
++    capacity: Arc<Semaphore>,
++    pinned: Arc<std::sync::Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
++}
++
++impl TurnAdmission {
++    fn new(capacity: usize) -> Self {
++        Self {
++            gates: std::sync::Mutex::new(HashMap::new()),
++            capacity: Arc::new(Semaphore::new(capacity)),
++            pinned: Arc::new(std::sync::Mutex::new(HashMap::new())),
++        }
++    }
++
++    fn gate(&self, key: &str) -> Arc<Mutex<()>> {
++        let mut gates = self.gates.lock().unwrap();
++        gates.retain(|_, gate| gate.strong_count() > 0);
++        if let Some(gate) = gates.get(key).and_then(std::sync::Weak::upgrade) {
++            return gate;
++        }
++        let gate = Arc::new(Mutex::new(()));
++        gates.insert(key.to_owned(), Arc::downgrade(&gate));
++        gate
++    }
++
++    fn pin(&self, key: &str, thread: OwnedMutexGuard<()>, capacity: OwnedSemaphorePermit) -> SessionTurn {
++        let (cancel, cancelled) = tokio::sync::watch::channel(false);
++        self.pinned.lock().unwrap().insert(key.to_owned(), cancel);
++        SessionTurn { key: key.to_owned(), pinned: self.pinned.clone(), cancelled, _thread: thread, _capacity: capacity }
++    }
++
++    async fn acquire(&self, key: &str) -> Result<SessionTurn> {
++        // Same-thread waiters must not occupy scarce global slots.
++        let thread = self.gate(key).lock_owned().await;
++        let capacity = self.capacity.clone().acquire_owned().await
++            .map_err(|_| anyhow!("session pool is shutting down"))?;
++        Ok(self.pin(key, thread, capacity))
++    }
++
++    fn try_acquire(&self, key: &str) -> Option<SessionTurn> {
++        let thread = self.gate(key).try_lock_owned().ok()?;
++        let capacity = self.capacity.clone().try_acquire_owned().ok()?;
++        Some(self.pin(key, thread, capacity))
++    }
++
++    fn is_pinned(&self, key: &str) -> bool {
++        self.pinned.lock().unwrap().contains_key(key)
++    }
+ }
+ 
+ type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
+@@ -313,8 +396,11 @@
+         let _ = std::fs::create_dir_all(&openab_dir);
+         let mapping_path = openab_dir.join("thread_map.json");
+         let meta_path = openab_dir.join("session_meta.json");
+-        let suspended = Self::load_mapping(&mapping_path);
+-        let session_workdirs = Self::load_mapping(&meta_path);
++        let mapping = Self::load_mapping(&mapping_path);
++        let metadata = Self::load_mapping(&meta_path);
++        let storage_error = mapping.as_ref().err().or_else(|| metadata.as_ref().err()).map(ToString::to_string);
++        let suspended = mapping.unwrap_or_default();
++        let session_workdirs = metadata.unwrap_or_default();
+         Self {
+             state: RwLock::new(PoolState {
+                 active: HashMap::new(),
+@@ -330,7 +416,10 @@
+             }),
+             config,
+             max_sessions,
++            turns: TurnAdmission::new(max_sessions),
++            allocation: Mutex::new(()),
+             hung_threshold_secs,
++            storage_error,
+             mapping_path,
+             meta_path,
+             default_config_options,
+@@ -362,46 +451,32 @@
+         self
+     }
+ 
+-    fn load_mapping(path: &Path) -> HashMap<String, String> {
++    fn load_mapping(path: &Path) -> Result<HashMap<String, String>> {
+         match std::fs::read_to_string(path) {
+-            Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
+-                warn!(path = %path.display(), error = %e, "corrupt mapping file, starting fresh");
+-                HashMap::new()
+-            }),
+-            Err(_) => HashMap::new(),
+-        }
+-    }
+-
+-    fn save_mapping(&self, persisted: &HashMap<String, String>) {
+-        let data = match serde_json::to_string_pretty(persisted) {
+-            Ok(d) => d,
+-            Err(e) => {
+-                warn!(error = %e, "failed to serialize thread mapping");
+-                return;
+-            }
+-        };
+-        let tmp = self.mapping_path.with_extension("json.tmp");
+-        if let Err(e) =
+-            std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &self.mapping_path))
+-        {
+-            warn!(path = %self.mapping_path.display(), error = %e, "failed to persist thread mapping");
+-        }
+-    }
+-
+-    fn save_meta(&self, workdirs: &HashMap<String, String>) {
+-        let data = match serde_json::to_string_pretty(workdirs) {
+-            Ok(d) => d,
+-            Err(e) => {
+-                warn!(error = %e, "failed to serialize session metadata");
+-                return;
+-            }
+-        };
+-        let tmp = self.meta_path.with_extension("json.tmp");
+-        if let Err(e) =
+-            std::fs::write(&tmp, &data).and_then(|_| std::fs::rename(&tmp, &self.meta_path))
+-        {
+-            warn!(path = %self.meta_path.display(), error = %e, "failed to persist session metadata");
+-        }
++            Ok(data) => serde_json::from_str(&data).map_err(|e| anyhow!("cannot read session state {}: {e}", path.display())),
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
++            Err(e) => Err(anyhow!("cannot read session state {}: {e}", path.display())),
++        }
++    }
++
++    fn save_state(&self, path: &Path, entries: &HashMap<String, String>) -> Result<()> {
++        if let Some(error) = &self.storage_error { return Err(anyhow!("session persistence unavailable: {error}")); }
++        use std::io::Write;
++        let parent = path.parent().ok_or_else(|| anyhow!("session state has no parent directory"))?;
++        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
++        serde_json::to_writer_pretty(&mut tmp, entries)?;
++        tmp.flush()?;
++        tmp.as_file().sync_all()?;
++        tmp.persist(path).map_err(|e| anyhow!("cannot persist session state: {}", e.error))?;
++        Ok(())
++    }
++
++    fn save_mapping(&self, persisted: &HashMap<String, String>) -> Result<()> {
++        self.save_state(&self.mapping_path, persisted)
++    }
++
++    fn save_meta(&self, workdirs: &HashMap<String, String>) -> Result<()> {
++        self.save_state(&self.meta_path, workdirs)
+     }
+ 
+     /// Check if session state exists for this thread (active, suspended, or persisted).
+@@ -421,13 +496,37 @@
+         false
+     }
+ 
++    pub async fn acquire_turn(&self, thread_id: &str) -> Result<SessionTurn> {
++        if self.max_sessions == 0 {
++            return Err(anyhow!("pool.max_sessions must be greater than zero"));
++        }
++        self.turns.acquire(thread_id).await
++    }
++
++    pub fn try_acquire_turn(&self, thread_id: &str) -> Option<SessionTurn> {
++        self.turns.try_acquire(thread_id)
++    }
++
+     pub async fn get_or_create(
+         &self,
+         thread_id: &str,
+         working_dir_override: Option<&str>,
+     ) -> Result<bool> {
++        if let Some(error) = &self.storage_error {
++            return Err(anyhow!("session persistence unavailable; existing history was not overwritten: {error}"));
++        }
+         let create_gate = {
+             let mut state = self.state.write().await;
++            // Old keys omitted workspace/channel. Never guess which scoped thread
++            // owns that history, and never silently create a replacement session.
++            let parts: Vec<_> = thread_id.split(':').collect();
++            if parts.len() == 4 && parts[0] == "slack" {
++                let legacy = format!("slack:{}", parts[3]);
++                if !state.persisted.contains_key(thread_id) && !state.active.contains_key(thread_id)
++                    && (state.persisted.contains_key(&legacy) || state.active.contains_key(&legacy)) {
++                    return Err(anyhow!("此线程有旧版会话记录，需要先核实 workspace/channel 并迁移映射；原会话已保留，未另建对话。"));
++                }
++            }
+             get_or_insert_gate(&mut state.creating, thread_id)
+         };
+         let _create_guard = create_gate.lock().await;
+@@ -459,6 +558,10 @@
+             }
+         }
+ 
++        // Healthy sessions never wait for another thread's agent initialization.
++        // The per-thread create gate keeps this allocation decision stable.
++        let _allocation_guard = self.allocation.lock().await;
++
+         // Snapshot active handles so we can inspect them outside the state lock.
+         let snapshot: Vec<(String, Arc<Mutex<AcpConnection>>)> = {
+             let state = self.state.read().await;
+@@ -472,7 +575,7 @@
+         let mut eviction_candidate: Option<EvictionCandidate> = None;
+         let mut skipped_locked_candidates = 0usize;
+         for (key, conn) in snapshot {
+-            if key == thread_id {
++            if key == thread_id || self.turns.is_pinned(&key) {
+                 continue;
+             }
+             let conn_handle = Arc::clone(&conn);
+@@ -491,6 +594,16 @@
+                 candidate.2,
+             ) {
+                 eviction_candidate = Some(candidate);
++            }
++        }
++
++        {
++            let state = self.state.read().await;
++            let replacing = usize::from(state.active.contains_key(thread_id));
++            if state.active.len().saturating_sub(replacing) >= self.max_sessions
++                && eviction_candidate.is_none()
++            {
++                return Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions));
+             }
+         }
+ 
+@@ -609,11 +722,17 @@
+                             });
+                         } else {
+                             warn!(thread_id = %crate::redact::redact_session_ids(thread_id), session_id = %crate::redact::redact_session_ids(sid), error = %e,
+-                                "session/load failed, creating new session");
++                                "session/load failed; applying platform recovery policy");
+                         }
+                     }
+                 }
+             }
++        }
++
++        if saved_session_id.is_some() && !resumed && thread_id.starts_with("slack:") {
++            // Capacity eviction must not silently replace a Slack conversation.
++            // Retain the old mapping even for unsupported/permanent load errors.
++            return Err(anyhow!("无法恢复本线程原会话；原会话映射已保留，未创建替代对话。请检查后端恢复能力或会话状态。"));
+         }
+ 
+         if let Some(reason) = load_failed {
+@@ -673,8 +792,20 @@
+         }
+ 
+         if state.active.len() >= self.max_sessions {
++            // Initialization awaited external I/O: the earlier candidate may now
++            // be reserved. Re-scan current handles, and recheck under its mutex.
++            eviction_candidate = None;
++            for (key, handle) in &state.active {
++                if key == thread_id || self.turns.is_pinned(key) { continue; }
++                let Ok(conn) = handle.try_lock() else { continue; };
++                if better_candidate(eviction_candidate.as_ref().map(|(_, _, t, _)| *t), conn.last_active) {
++                    eviction_candidate = Some((key.clone(), handle.clone(), conn.last_active, conn.acp_session_id.clone()));
++                }
++            }
+             if let Some((key, expected_conn, _, sid)) = eviction_candidate {
+-                if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
++                let candidate_guard = expected_conn.try_lock();
++                if !self.turns.is_pinned(&key) && candidate_guard.is_ok()
++                    && remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
+                     state.cancel_handles.remove(&key);
+                     state.activity.remove(&key);
+                     state.pgids.remove(&key);
+@@ -703,13 +834,20 @@
+             return Err(anyhow!("pool exhausted ({} sessions)", self.max_sessions));
+         }
+ 
++        let mut persisted = state.persisted.clone();
+         if cancel_session_id.is_empty() {
+-            state.persisted.remove(thread_id);
++            persisted.remove(thread_id);
+         } else {
+-            state
+-                .persisted
+-                .insert(thread_id.to_string(), cancel_session_id.clone());
+-        }
++            persisted.insert(thread_id.to_string(), cancel_session_id.clone());
++        }
++        if working_dir_override.is_some() {
++            let mut workdirs = state.session_workdirs.clone();
++            workdirs.entry(thread_id.to_string()).or_insert_with(|| effective_workdir.clone());
++            self.save_meta(&workdirs)?;
++            state.session_workdirs = workdirs;
++        }
++        self.save_mapping(&persisted)?;
++        state.persisted = persisted;
+         state.suspended.remove(thread_id);
+         state.active.insert(thread_id.to_string(), new_conn);
+         state
+@@ -729,17 +867,6 @@
+         if let Some(token) = session_token {
+             install_facade_token(&mut state, thread_id, token, self.session_registrar.as_ref());
+         }
+-        self.save_mapping(&state.persisted);
+-
+-        // Persist workspace override only after session spawn succeeded (口渡 F2).
+-        if working_dir_override.is_some() {
+-            state
+-                .session_workdirs
+-                .entry(thread_id.to_string())
+-                .or_insert_with(|| effective_workdir.clone());
+-            self.save_meta(&state.session_workdirs);
+-        }
+-
+         // Return true only for genuinely new sessions — not resumed or reconnected ones.
+         // A session with prior state (saved_session_id or had_existing) is a resume,
+         // even if we had to spawn a new ACP process. ADR §2.2: directives are first-message-only.
+@@ -937,8 +1064,8 @@
+         // the guard cannot revoke — do it synchronously here too (F3).
+         #[cfg(feature = "acp-mcp")]
+         revoke_facade_token_for_key(&mut state, thread_id, self.session_registrar.as_ref());
+-        self.save_mapping(&state.persisted);
+-        self.save_meta(&state.session_workdirs);
++        self.save_mapping(&state.persisted)?;
++        self.save_meta(&state.session_workdirs)?;
+         Ok(had_state)
+     }
+ 
+@@ -985,6 +1112,8 @@
+                         // process group directly or the agent leaks forever (F4).
+                         let stdin_handle = cancel_map.get(&key).map(|(stdin, _)| Arc::clone(stdin));
+                         let pgid = pgid_map.get(&key).copied();
++                        // Capture this generation's sender; never revoke a successor.
++                        let turn_cancel = self.turns.pinned.lock().unwrap().get(&key).cloned();
+                         tokio::spawn(async move {
+                             if let (Some(stdin), Some(session_id)) = (stdin_handle, session_id) {
+                                 let _ = tokio::time::timeout(
+@@ -1008,6 +1137,7 @@
+                                 .await;
+                             }
+                             kill_pgid_after_grace(pgid).await;
++                            if let Some(cancel) = turn_cancel { let _ = cancel.send(true); }
+                         });
+                         hung.push((key, conn_handle));
+                     }
+@@ -1035,6 +1165,7 @@
+ 
+         let mut state = self.state.write().await;
+         for (key, expected_conn, sid) in stale {
++            if self.turns.is_pinned(&key) { continue; }
+             if remove_if_same_handle(&mut state.active, &key, &expected_conn).is_some() {
+                 info!(thread_id = %crate::redact::redact_session_ids(&key), "cleaning up idle session");
+                 state.cancel_handles.remove(&key);
+@@ -1052,7 +1183,17 @@
+             }
+         }
+         for (key, expected_conn) in hung {
++            // A leased Slack turn cannot resume until its old prompt unwinds or
++            // generation-specific teardown cancellation releases admission.
++            // Preserve conversation identity for that safe subsequent resume.
++            let saved_slack = if key.starts_with("slack:") && self.turns.is_pinned(&key) {
++                state.persisted.get(&key).cloned()
++            } else { None };
+             if apply_hung_eviction(&mut state, &key, &expected_conn) {
++                if let Some(sid) = saved_slack {
++                    state.persisted.insert(key.clone(), sid.clone());
++                    state.suspended.insert(key.clone(), sid);
++                }
+                 // The DropGuard cannot fire — the hung streaming task still holds an Arc, so the
+                 // connection never drops. Revoke the exact token synchronously, or it keeps
+                 // resolving to the channel and a successor's tunnel becomes reachable by the hung
+@@ -1064,11 +1205,12 @@
+                 warn!(thread_id = %crate::redact::redact_session_ids(&key), "hung session was replaced before eviction; maps untouched");
+             }
+         }
+-        self.save_mapping(&state.persisted);
+-        self.save_meta(&state.session_workdirs);
++        if let Err(e) = self.save_mapping(&state.persisted) { warn!(error = %e, "failed to persist session mapping"); }
++        if let Err(e) = self.save_meta(&state.session_workdirs) { warn!(error = %e, "failed to persist session metadata"); }
+     }
+ 
+     pub async fn shutdown(&self) {
++        self.turns.capacity.close();
+         // Snapshot active handles, then drop state lock before awaiting
+         // per-connection mutexes (lock ordering: never hold state while
+         // awaiting a connection lock).
+@@ -1094,7 +1236,7 @@
+             state.persisted.insert(key.clone(), sid.clone());
+             state.suspended.insert(key, sid);
+         }
+-        self.save_mapping(&state.persisted);
++        if let Err(e) = self.save_mapping(&state.persisted) { warn!(error = %e, "failed to persist session mapping"); }
+         let count = state.active.len();
+         state.active.clear();
+         state.cancel_handles.clear();
+@@ -1115,6 +1257,173 @@
+     use std::sync::Arc;
+     use tokio::sync::Mutex;
+     use tokio::time::Instant;
++
++
++    #[tokio::test]
++    async fn corrupt_mapping_is_not_replaced_by_fresh_session_or_shutdown() {
++        let dir = tempfile::tempdir().unwrap();
++        std::fs::write(dir.path().join("thread_map.json"), "{corrupt").unwrap();
++        let pool = super::SessionPool::new_in(crate::config::AgentConfig::default(), 1, 0, HashMap::new(), dir.path().into());
++        let error = pool.get_or_create("slack:T:C:123.456", None).await.unwrap_err().to_string();
++        assert!(error.contains("session persistence unavailable"));
++        pool.cleanup_idle(0).await;
++        pool.shutdown().await;
++        assert_eq!(std::fs::read_to_string(dir.path().join("thread_map.json")).unwrap(), "{corrupt");
++    }
++
++    #[tokio::test]
++    async fn legacy_mapping_requires_explicit_scoped_migration_before_new_session() {
++        let dir = tempfile::tempdir().unwrap();
++        std::fs::write(dir.path().join("thread_map.json"), r#"{"slack:123.456":"native-existing"}"#).unwrap();
++        let pool = super::SessionPool::new_in(crate::config::AgentConfig::default(), 1, 0, HashMap::new(), dir.path().into());
++        let error = pool.get_or_create("slack:T:C:123.456", None).await.unwrap_err().to_string();
++        assert!(error.contains("迁移映射"));
++        assert_eq!(pool.state.read().await.persisted["slack:123.456"], "native-existing");
++        assert!(!pool.state.read().await.persisted.contains_key("slack:T:C:123.456"));
++    }
++
++    #[tokio::test]
++    async fn zero_capacity_fails_without_waiting_forever() {
++        let dir = tempfile::tempdir().unwrap();
++        let pool = super::SessionPool::new_in(crate::config::AgentConfig::default(), 0, 0, HashMap::new(), dir.path().into());
++        assert!(pool.acquire_turn("A").await.is_err());
++    }
++
++    #[tokio::test]
++    async fn hung_turn_signal_drops_prompt_and_releases_capacity_without_revoking_successor() {
++        let turns = Arc::new(super::TurnAdmission::new(1));
++        let mut first = turns.acquire("A").await.unwrap();
++        let revoke = turns.pinned.lock().unwrap().get("A").unwrap().clone();
++        let task = tokio::spawn(async move {
++            tokio::select! {
++                _ = std::future::pending::<()>() => panic!("pending prompt completed"),
++                _ = first.cancelled() => {},
++            }
++        });
++        assert!(turns.try_acquire("B").is_none());
++        revoke.send(true).unwrap();
++        task.await.unwrap();
++        let _successor = turns.try_acquire("A").unwrap();
++        assert!(revoke.send(true).is_err(), "old generation cannot cancel successor");
++        assert!(turns.try_acquire("B").is_none());
++    }
++
++    #[tokio::test]
++    async fn turn_admission_serializes_same_thread_and_allows_other_threads() {
++        let turns = super::TurnAdmission::new(2);
++        let a1 = turns.acquire("A").await.unwrap();
++        assert!(turns.try_acquire("A").is_none());
++        let b1 = turns.try_acquire("B").expect("different threads can execute concurrently");
++        assert!(turns.try_acquire("C").is_none());
++        assert!(turns.is_pinned("A") && turns.is_pinned("B"));
++        drop(a1);
++        assert!(!turns.is_pinned("A"));
++        let a2 = turns.try_acquire("A").unwrap();
++        drop((a2, b1));
++        assert_eq!(turns.capacity.available_permits(), 2);
++    }
++
++    #[tokio::test]
++    async fn turn_admission_capacity_one_queues_fifo_and_cancel_releases_waiter() {
++        let turns = Arc::new(super::TurnAdmission::new(1));
++        let a1 = turns.acquire("A").await.unwrap();
++        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
++        let b = turns.clone();
++        let b1 = tokio::spawn(async move {
++            started_tx.send(()).unwrap();
++            b.acquire("B").await.unwrap()
++        });
++        started_rx.await.unwrap();
++        tokio::task::yield_now().await;
++        assert!(!b1.is_finished());
++        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
++        let a = turns.clone();
++        let a2 = tokio::spawn(async move {
++            started_tx.send(()).unwrap();
++            a.acquire("A").await.unwrap()
++        });
++        started_rx.await.unwrap();
++        drop(a1);
++        let b1 = b1.await.unwrap();
++        assert!(!a2.is_finished(), "B keeps its FIFO capacity position");
++        a2.abort();
++        assert!(matches!(a2.await, Err(e) if e.is_cancelled()));
++        drop(b1);
++        assert!(turns.try_acquire("A").is_some(), "aborted waiters do not leak gates or slots");
++    }
++
++    #[tokio::test]
++    async fn turn_admission_failure_unwind_and_shutdown_do_not_strand_queue() {
++        let turns = super::TurnAdmission::new(1);
++        let result: anyhow::Result<()> = async {
++            let _turn = turns.acquire("A").await?;
++            Err(anyhow::anyhow!("fixture failure"))
++        }.await;
++        assert!(result.is_err());
++        assert!(turns.try_acquire("B").is_some());
++        turns.capacity.close();
++        assert!(turns.acquire("A").await.is_err());
++    }
++
++    #[tokio::test]
++    async fn pool_thread_resume_after_capacity_queue_and_restart() {
++        let root = tempfile::tempdir().unwrap();
++        let script = root.path().join("fixture.py");
++        std::fs::write(&script, r#"
++import sys,json,os,uuid
++base=os.path.dirname(__file__)
++for line in sys.stdin:
++ q=json.loads(line);method=q.get('method');p=q.get('params',{});r={}
++ if method=='initialize':r={'protocolVersion':1,'agentCapabilities':{'loadSession':True},'agentInfo':{'name':'fixture','version':'1'}}
++ elif method=='session/new':
++  sid=str(uuid.uuid4());open(os.path.join(base,sid),'w').write('session');r={'sessionId':sid}
++ elif method=='session/load':
++  sid=p['sessionId'];assert os.path.exists(os.path.join(base,sid));r={'sessionId':sid}
++ print(json.dumps({'jsonrpc':'2.0','id':q['id'],'result':r}),flush=True)
++"#).unwrap();
++        let config = || {
++            let mut config = crate::config::AgentConfig::default();
++            config.command = "/usr/bin/python3".into();
++            config.args = vec![script.to_string_lossy().into()];
++            config.working_dir = root.path().to_string_lossy().into();
++            config
++        };
++        let pool = Arc::new(super::SessionPool::new_in(config(), 1, 0, HashMap::new(), root.path().join("state")));
++        let a1 = pool.acquire_turn("slack:T:C:A").await.unwrap();
++        assert!(pool.get_or_create("slack:T:C:A", None).await.unwrap());
++        let sid_a = pool.state.read().await.persisted["slack:T:C:A"].clone();
++        let b_pool = pool.clone();
++        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
++        let b = tokio::spawn(async move {
++            started_tx.send(()).unwrap();
++            let _turn = b_pool.acquire_turn("slack:T:C:B").await.unwrap();
++            assert!(b_pool.get_or_create("slack:T:C:B", None).await.unwrap());
++            let sid = b_pool.state.read().await.persisted["slack:T:C:B"].clone();
++            sid
++        });
++        started_rx.await.unwrap();
++        assert!(!b.is_finished());
++        // Reservation protects the gap between creation and taking the connection mutex.
++        pool.cleanup_idle(0).await;
++        assert!(pool.state.read().await.active.contains_key("slack:T:C:A"));
++        drop(a1);
++        let sid_b = b.await.unwrap();
++        assert_ne!(sid_a, sid_b);
++        {
++            let _turn = pool.acquire_turn("slack:T:C:A").await.unwrap();
++            assert!(!pool.get_or_create("slack:T:C:A", None).await.unwrap());
++            assert_eq!(pool.state.read().await.persisted["slack:T:C:A"], sid_a);
++        }
++        pool.shutdown().await;
++        drop(pool);
++        let restarted = super::SessionPool::new_in(config(), 1, 0, HashMap::new(), root.path().join("state"));
++        for (key, expected) in [("slack:T:C:A", &sid_a), ("slack:T:C:B", &sid_b)] {
++            let _turn = restarted.acquire_turn(key).await.unwrap();
++            assert!(!restarted.get_or_create(key, None).await.unwrap());
++            assert_eq!(&restarted.state.read().await.persisted[key], expected);
++        }
++        restarted.shutdown().await;
++    }
+ 
+     #[tokio::test]
+     async fn model_controls_reject_busy_stale_and_unknown_without_changing_other_thread() {
+--- a/crates/openab-core/src/adapter.rs
++++ b/crates/openab-core/src/adapter.rs
+@@ -242,13 +242,26 @@
+     /// Thread within a channel (e.g. Slack thread_ts, Telegram topic_id).
+     /// For Discord, threads are separate channels so this is None.
+     pub thread_id: Option<String>,
+-    /// Parent channel if this is a thread-as-channel (Discord).
++    /// Parent channel for Discord; authenticated workspace/team ID for Slack.
+     pub parent_id: Option<String>,
+     /// Originating gateway event ID, propagated back in `GatewayReply.reply_to`
+     /// so the gateway can correlate replies with inbound events (e.g. LINE reply tokens).
+     /// Excluded from Hash/Eq — two ChannelRefs pointing to the same channel are
+     /// equal regardless of which event they originated from.
+     pub origin_event_id: Option<String>,
++}
++
++impl ChannelRef {
++    /// Stable conversation identity, separate from raw platform reply coordinates.
++    pub fn session_key(&self) -> String {
++        let root = self.thread_id.as_deref().unwrap_or(&self.channel_id);
++        if self.platform == "slack" {
++            if let Some(team) = self.parent_id.as_deref() {
++                return format!("slack:{team}:{}:{root}", self.channel_id);
++            }
++        }
++        format!("{}:{root}", self.platform)
++    }
+ }
+ 
+ impl PartialEq for ChannelRef {
+@@ -606,14 +619,8 @@
+         let content_blocks =
+             Self::pack_arrival_event(&ctx.sender_json, &ctx.prompt, ctx.extra_blocks);
+ 
+-        let thread_key = format!(
+-            "{}:{}",
+-            adapter.platform(),
+-            ctx.thread_channel
+-                .thread_id
+-                .as_deref()
+-                .unwrap_or(&ctx.thread_channel.channel_id)
+-        );
++        let thread_key = ctx.thread_channel.session_key();
++        let mut turn = self.pool.acquire_turn(&thread_key).await?;
+ 
+         if let Err(e) = self.pool.get_or_create(&thread_key, None).await {
+             let msg = format_user_error(&e.to_string());
+@@ -640,7 +647,7 @@
+             reactions.set_queued().await;
+         }
+ 
+-        let result = self
++        let prompt = self
+             .stream_prompt(
+                 adapter,
+                 &thread_key,
+@@ -648,8 +655,11 @@
+                 &ctx.thread_channel,
+                 reactions.clone(),
+                 ctx.other_bot_present,
+-            )
+-            .await;
++            );
++        let result = tokio::select! {
++            result = prompt => result,
++            _ = turn.cancelled() => Err(anyhow::anyhow!("session recovery interrupted this turn; verify its effects before retrying")),
++        };
+ 
+         if !assistant_status {
+             match &result {
+--- a/crates/openab-core/src/dispatch.rs
++++ b/crates/openab-core/src/dispatch.rs
+@@ -130,6 +130,11 @@
+     /// Bot home directory (security boundary for workspace resolution).
+     fn bot_home(&self) -> std::path::PathBuf;
+ 
++    /// Reserve a turn before creating/resuming its session. Tests may opt out.
++    async fn acquire_turn(&self, _session_key: &str) -> Result<Option<crate::acp::pool::SessionTurn>> {
++        Ok(None)
++    }
++
+     /// Ensure the ACP session for `session_key` exists (idempotent).
+     /// Returns `true` if a new session was created, `false` if it already existed.
+     async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool>;
+@@ -164,6 +169,10 @@
+ 
+     fn bot_home(&self) -> std::path::PathBuf {
+         self.bot_home_path()
++    }
++
++    async fn acquire_turn(&self, session_key: &str) -> Result<Option<crate::acp::pool::SessionTurn>> {
++        self.pool().acquire_turn(session_key).await.map(Some)
+     }
+ 
+     async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool> {
+@@ -305,11 +314,7 @@
+     /// Unlike dispatcher keys, session keys never include sender identity.
+     /// They track the logical conversation thread across all grouping modes.
+     fn session_key(thread_channel: &ChannelRef) -> String {
+-        let logical_thread_id = thread_channel
+-            .thread_id
+-            .as_deref()
+-            .unwrap_or(&thread_channel.channel_id);
+-        format!("{}:{}", thread_channel.platform, logical_thread_id)
++        thread_channel.session_key()
+     }
+ 
+     /// Submit one arrival event for the given thread.
+@@ -693,6 +698,26 @@
+     let workspace_override: Option<String> =
+         ws_resolved.as_ref().and_then(|r| r.as_ref().ok().cloned());
+ 
++    // Keep the future alive while reporting a wait; dropping/recreating it would
++    // lose the FIFO position. The lease spans setup, directives and the full turn.
++    let admission = target.acquire_turn(&session_key);
++    tokio::pin!(admission);
++    let admitted = tokio::select! {
++        result = &mut admission => result,
++        _ = tokio::time::sleep(Duration::from_millis(500)) => {
++            let _ = adapter.send_message(&dispatch_channel,
++                "⏳ 已排队：正在等待会话执行空位；轮到后会在本线程继续。") .await;
++            admission.await
++        }
++    };
++    let mut turn = match admitted {
++        Ok(turn) => turn,
++        Err(e) => {
++            let _ = adapter.send_message(&dispatch_channel, &format!("⚠️ {}", format_user_error(&e.to_string()))).await;
++            return;
++        }
++    };
++
+     // Ensure session exists. The create_gate mutex inside get_or_create serializes
+     // concurrent callers — only the winner gets created_now == true.
+     let created_now = match target
+@@ -768,7 +793,7 @@
+     ));
+     // 👀 already applied above; skip set_queued() to avoid double-reaction.
+ 
+-    let result = target
++    let prompt = target
+         .stream_prompt_blocks(
+             adapter,
+             &session_key,
+@@ -777,8 +802,15 @@
+             reactions.clone(),
+             other_bot_present,
+             recipient,
+-        )
+-        .await;
++        );
++    let result = if let Some(turn) = turn.as_mut() {
++        tokio::select! {
++            result = prompt => result,
++            _ = turn.cancelled() => Err(anyhow::anyhow!("会话执行失去响应，已终止本次等待；请核实任务执行结果后再重试。")),
++        }
++    } else {
++        prompt.await
++    };
+ 
+     // In assistant status mode, all status is conveyed via
+     // assistant.threads.setStatus — skip emoji reactions entirely.
+--- a/crates/openab-core/src/slack.rs
++++ b/crates/openab-core/src/slack.rs
+@@ -99,11 +99,111 @@
+     bot_uid.is_some_and(|uid| !uid.is_empty() && sender_uid == Some(uid))
+ }
+ 
+-fn reset_human_mention_turns(tracker: &mut BotTurnTracker, event: &serde_json::Value, admitted: bool) {
+-    if !admitted { return; }
+-    let key = event["thread_ts"].as_str().map(str::to_string).unwrap_or_else(||
+-        format!("{}:{}", event["channel"].as_str().unwrap_or(""), event["ts"].as_str().unwrap_or("")));
+-    tracker.on_human_message(&key);
++/// Slack timestamps are only unique within a channel. Keep API IDs raw and
++/// scope every internal thread identity by the receiving workspace and channel.
++fn slack_thread_identity(team: &str, channel: &str, root: &str) -> String {
++    format!("{team}:{channel}:{root}")
++}
++
++fn slack_event_thread_identity(team: &str, event: &serde_json::Value) -> String {
++    slack_thread_identity(
++        team,
++        event["channel"].as_str().unwrap_or(""),
++        event["thread_ts"].as_str().or_else(|| event["ts"].as_str()).unwrap_or(""),
++    )
++}
++
++fn reset_human_mention_turns(
++    tracker: &mut BotTurnTracker,
++    team: &str,
++    event: &serde_json::Value,
++    admitted: bool,
++) {
++    if admitted {
++        tracker.on_human_message(&slack_event_thread_identity(team, event));
++    }
++}
++
++/// Socket Mode can redeliver an event after reconnect or acknowledgement loss.
++/// Claim only the selected app_mention/message route, so an ignored message
++/// event cannot consume the corresponding app_mention. Kept across reconnects.
++#[derive(Default)]
++struct SlackEventDeduper {
++    seen: HashMap<String, std::time::Instant>,
++}
++
++impl SlackEventDeduper {
++    const TTL: std::time::Duration = std::time::Duration::from_secs(600);
++    const MAX: usize = 10_000;
++
++    fn claim(&mut self, team: &str, event: &serde_json::Value, now: std::time::Instant) -> bool {
++        let Some(channel) = event["channel"].as_str().filter(|id| !id.is_empty()) else { return false; };
++        let Some(ts) = event["ts"].as_str().filter(|id| !id.is_empty()) else { return false; };
++        if team.is_empty() { return false; }
++        let key = slack_thread_identity(team, channel, ts);
++        if self.seen.get(&key).is_some_and(|seen| now.saturating_duration_since(*seen) < Self::TTL) {
++            return false;
++        }
++        if self.seen.len() >= Self::MAX {
++            self.seen.retain(|_, seen| now.saturating_duration_since(*seen) < Self::TTL);
++            if self.seen.len() >= Self::MAX {
++                if let Some(oldest) = self.seen.iter().min_by_key(|(_, seen)| **seen).map(|(key, _)| key.clone()) {
++                    self.seen.remove(&oldest);
++                }
++            }
++        }
++        self.seen.insert(key, now);
++        true
++    }
++}
++
++/// Registered synchronously by the Socket Mode receive loop. A mutex first
++/// acquired inside spawned tasks would order task scheduling, not event arrival.
++#[derive(Default)]
++struct SlackIngressOrder {
++    tails: HashMap<String, watch::Receiver<bool>>,
++}
++
++struct SlackIngressTurn {
++    predecessor: Option<watch::Receiver<bool>>,
++    // Dropping this sender (including panic/abort) releases the completion bridge.
++    _finished: tokio::sync::oneshot::Sender<()>,
++}
++
++async fn wait_for_slack_ingress(mut predecessor: Option<watch::Receiver<bool>>) {
++    if let Some(previous) = predecessor.as_mut() {
++        loop {
++            let completed = *previous.borrow_and_update();
++            if completed || previous.changed().await.is_err() {
++                break;
++            }
++        }
++    }
++}
++
++impl SlackIngressOrder {
++    fn register(&mut self, key: String) -> SlackIngressTurn {
++        self.tails.retain(|_, tail| !*tail.borrow());
++        let (completed, tail) = watch::channel(false);
++        let predecessor = self.tails.insert(key, tail);
++        let (finished, worker_done) = tokio::sync::oneshot::channel();
++        let bridge_predecessor = predecessor.clone();
++        // Keep predecessor ordering even if a waiting middle worker is aborted:
++        // its successor cannot bypass an earlier worker still preparing a turn.
++        tokio::spawn(async move {
++            wait_for_slack_ingress(bridge_predecessor).await;
++            let _ = worker_done.await;
++            let _ = completed.send(true);
++        });
++        SlackIngressTurn { predecessor, _finished: finished }
++    }
++}
++
++impl SlackIngressTurn {
++    async fn wait(mut self) -> Self {
++        wait_for_slack_ingress(self.predecessor.take()).await;
++        self
++    }
+ }
+ 
+ // --- SlackAdapter: implements ChatAdapter for Slack ---
+@@ -131,9 +231,9 @@
+     user_cache: tokio::sync::Mutex<HashMap<String, (String, tokio::time::Instant)>>,
+     /// Cache: Bot ID (B...) → Bot User ID (U...) for trusted_bot_ids matching.
+     bot_id_cache: tokio::sync::Mutex<HashMap<String, String>>,
+-    /// Positive-only cache: thread_ts → cached_at for threads where bot has participated.
++    /// Positive-only cache: workspace:channel:thread_ts → cached_at for threads where bot has participated.
+     participated_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+-    /// Positive-only cache: thread_ts → cached_at for threads where other bots have posted.
++    /// Positive-only cache: workspace:channel:thread_ts → cached_at for threads where other bots have posted.
+     /// Like participation, a thread becoming multi-bot is irreversible (bot messages don't disappear).
+     multibot_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+     /// Persistent disk cache for multibot thread detection (survives restarts).
+@@ -148,7 +248,7 @@
+     /// reply that @-mentions another bot re-firing app_mention in multi-agent
+     /// threads). Mirrors `[gateway] streaming`.
+     streaming: bool,
+-    /// streaming message ts → state. active=false = degraded (post+edit fallback).
++    /// workspace:channel:message_ts → state. active=false = degraded (post+edit fallback).
+     /// Lifecycle: stream_begin inserts, stream_finish removes; insert_stream
+     /// bounds the map (STREAM_CACHE_MAX) as a safety net against aborted turns.
+     streams: tokio::sync::Mutex<HashMap<String, StreamEntry>>,
+@@ -201,7 +301,11 @@
+             self.model_notice(channel, thread, user, "仅 owner 可以查看和切换此线程模型。").await;
+             return;
+         }
+-        let key = format!("slack:{thread}");
++        let key = format!("slack:{}", slack_thread_identity(team, channel, thread));
++        let Some(_turn) = router.pool().try_acquire_turn(&key) else {
++            self.model_notice(channel, thread, user, "当前执行容量被占用，或此线程正在处理请求。完成后请再次发送“模型”；当前模型未变更。").await;
++            return;
++        };
+         if router.pool().get_or_create(&key, None).await.is_err() {
+             self.model_notice(channel, thread, user, "无法建立此线程的模型会话，请稍后重试。").await;
+             return;
+@@ -209,7 +313,7 @@
+         let (session, options) = match router.pool().try_config_snapshot(&key).await {
+             Ok(Some(snapshot)) => snapshot,
+             Ok(None) => {
+-                self.model_notice(channel, thread, user, "此线程正在处理请求。完成后请再次发送“模型”；当前模型未变更。").await;
++                self.model_notice(channel, thread, user, "当前执行容量被占用，或此线程正在处理请求。完成后请再次发送“模型”；当前模型未变更。").await;
+                 return;
+             }
+             Err(_) => {
+@@ -260,14 +364,19 @@
+                 return;
+             }
+         };
++        let key = format!("slack:{}", slack_thread_identity(&menu.team, &menu.channel, &menu.thread));
++        let Some(_turn) = router.pool().try_acquire_turn(&key) else {
++            drop(menus);
++            self.model_notice(channel, thread, user, "当前执行容量被占用，或此线程正在处理请求，未切换模型。完成后可再次选择。").await;
++            return;
++        };
+         // Claim once before awaiting ACP. Replay cannot perform a second mutation.
+         menus.remove(token);
+         drop(menus);
+-        let key = format!("slack:{}", menu.thread);
+         match router.pool().try_set_config_for_session(&key,&menu.session,&config_id,&value).await {
+             Ok(None) => {
+                 self.model_menus.lock().await.insert(token.to_string(),menu.clone());
+-                self.model_notice(&menu.channel,&menu.thread,user,"此线程正在处理请求，未切换模型。完成后可再次选择。").await;
++                self.model_notice(&menu.channel,&menu.thread,user,"当前执行容量被占用，或此线程正在处理请求，未切换模型。完成后可再次选择。").await;
+             }
+             Ok(Some(options)) => {
+                 let actual = options.iter().find(|o|o.id == config_id).map(|o|o.current_value.as_str());
+@@ -295,16 +404,17 @@
+     /// Eagerly record that another bot has posted in a thread. Called from the
+     /// event loop when a bot message arrives, so multibot detection doesn't
+     /// depend on fetching thread history. Idempotent.
+-    async fn note_other_bot_in_thread(&self, thread_ts: &str) {
++    async fn note_other_bot_in_thread(&self, team: &str, channel: &str, thread_ts: &str) {
++        let key = slack_thread_identity(team, channel, thread_ts);
+         {
+             let mut cache = self.multibot_threads.lock().await;
+             cache
+-                .entry(thread_ts.to_string())
++                .entry(key.clone())
+                 .or_insert_with(tokio::time::Instant::now);
+             enforce_cache_bounds(&mut cache, self.session_ttl);
+         }
+         // Persist to disk — multibot is irreversible
+-        self.multibot_cache.mark_multibot(thread_ts).await;
++        self.multibot_cache.mark_multibot(&key).await;
+     }
+ 
+ 
+@@ -490,19 +600,20 @@
+     /// Involved = parent message @mentions the bot OR any message in thread is from the bot.
+     /// Fail-closed: returns `(false, false)` on API error (consistent with Discord's approach).
+     /// Caches positive results only — both states are irreversible.
+-    async fn bot_participated_in_thread(&self, channel: &str, thread_ts: &str) -> (bool, bool) {
++    async fn bot_participated_in_thread(&self, team: &str, channel: &str, thread_ts: &str) -> (bool, bool) {
++        let key = slack_thread_identity(team, channel, thread_ts);
+         let cached_involved = {
+             let cache = self.participated_threads.lock().await;
+             cache
+-                .get(thread_ts)
++                .get(&key)
+                 .is_some_and(|ts| ts.elapsed() < self.session_ttl)
+         };
+         let cached_multibot = {
+             let cache = self.multibot_threads.lock().await;
+             cache
+-                .get(thread_ts)
++                .get(&key)
+                 .is_some_and(|ts| ts.elapsed() < self.session_ttl)
+-        } || self.multibot_cache.is_multibot(thread_ts);
++        } || self.multibot_cache.is_multibot(&key);
+ 
+         // Eager multibot detection from message events populates the cache
+         // before this runs. When already involved and cached, skip the fetch.
+@@ -554,7 +665,7 @@
+         let other_bot_present = cached_multibot;
+ 
+         if involved {
+-            self.cache_participation(thread_ts).await;
++            self.cache_participation(&key).await;
+         }
+ 
+         (involved, other_bot_present)
+@@ -627,7 +738,7 @@
+                 platform: "slack".into(),
+                 channel_id: channel.channel_id.clone(),
+                 thread_id: channel.thread_id.clone(),
+-                parent_id: None,
++                parent_id: channel.parent_id.clone(),
+                 origin_event_id: None,
+             },
+             message_id: ts.to_string(),
+@@ -645,7 +756,7 @@
+             platform: "slack".into(),
+             channel_id: channel.channel_id.clone(),
+             thread_id: Some(trigger_msg.message_id.clone()),
+-            parent_id: None,
++            parent_id: channel.parent_id.clone(),
+             origin_event_id: None,
+         })
+     }
+@@ -741,7 +852,7 @@
+                 platform: "slack".into(),
+                 channel_id: channel.channel_id.clone(),
+                 thread_id: channel.thread_id.clone(),
+-                parent_id: None,
++                parent_id: channel.parent_id.clone(),
+                 origin_event_id: None,
+             },
+             message_id: ts,
+@@ -753,7 +864,7 @@
+                 Ok(resp) => {
+                     if let Some(ts) = resp["ts"].as_str() {
+                         self.insert_stream(
+-                            ts.to_string(),
++                            slack_thread_identity(channel.parent_id.as_deref().unwrap_or(""), &channel.channel_id, ts),
+                             StreamEntry { active: true, degraded_buf: String::new() },
+                         )
+                         .await;
+@@ -774,7 +885,7 @@
+         // Degraded fallback: plain placeholder via send_message; mark inactive.
+         let msg = self.send_message(channel, "…").await?;
+         self.insert_stream(
+-            msg.message_id.clone(),
++            slack_thread_identity(channel.parent_id.as_deref().unwrap_or(""), &channel.channel_id, &msg.message_id),
+             StreamEntry { active: false, degraded_buf: String::new() },
+         )
+         .await;
+@@ -783,16 +894,17 @@
+ 
+     async fn stream_append(&self, msg: &MessageRef, delta: &str) -> Result<()> {
+         let ts = &msg.message_id;
++        let key = slack_thread_identity(msg.channel.parent_id.as_deref().unwrap_or(""), &msg.channel.channel_id, ts);
+         let active = {
+             let map = self.streams.lock().await;
+-            map.get(ts).map(|e| e.active).unwrap_or(false)
++            map.get(&key).map(|e| e.active).unwrap_or(false)
+         };
+         if active {
+             let body = build_append_stream_body(&msg.channel.channel_id, ts, delta);
+             if let Err(e) = self.api_post("chat.appendStream", body).await {
+                 warn!(error = %e, "chat.appendStream failed (cosmetic; final replace will correct)");
+             }
+-        } else if let Some(cumulative) = self.accumulate_degraded(ts, delta).await {
++        } else if let Some(cumulative) = self.accumulate_degraded(&key, delta).await {
+             let _ = self.edit_message(msg, &cumulative).await; // cosmetic mid-stream
+         }
+         Ok(())
+@@ -800,9 +912,10 @@
+ 
+     async fn stream_finish(&self, msg: &MessageRef, final_content: &str) -> Result<()> {
+         let ts = &msg.message_id;
++        let key = slack_thread_identity(msg.channel.parent_id.as_deref().unwrap_or(""), &msg.channel.channel_id, ts);
+         let active = {
+             let map = self.streams.lock().await;
+-            map.get(ts).map(|e| e.active).unwrap_or(false)
++            map.get(&key).map(|e| e.active).unwrap_or(false)
+         };
+         if active {
+             // Close the native stream WITHOUT re-sending content. The reply was
+@@ -835,7 +948,7 @@
+                 }
+             }
+         }
+-        self.streams.lock().await.remove(ts);
++        self.streams.lock().await.remove(&key);
+         Ok(())
+     }
+ 
+@@ -1012,6 +1125,8 @@
+     // cold-cache `auth.test` inline in the read loop.
+     let _ = adapter.get_bot_user_id().await;
+     let mut backoff_secs = 1u64;
++    let mut event_deduper = SlackEventDeduper::default();
++    let mut ingress_order = SlackIngressOrder::default();
+ 
+     loop {
+         // Check for shutdown before (re)connecting
+@@ -1110,6 +1225,12 @@
+                                     // Route events
+                                     if envelope["type"].as_str() == Some("events_api") {
+                                         let event = &envelope["payload"]["event"];
++                                        let event_team = envelope["payload"]["team_id"].as_str().unwrap_or("");
++                                        // Never merge an unscoped live event into another workspace.
++                                        if event_team.is_empty() {
++                                            warn!("Slack event missing receiving workspace ID, ignoring");
++                                            continue;
++                                        }
+                                         let event_type = event["type"].as_str().unwrap_or("");
+                                         match event_type {
+                                             "app_mention" => {
+@@ -1130,7 +1251,9 @@
+                                                 }
+                                                 let admitted = (allow_all_channels || allowed_channels.contains(channel_id))
+                                                     && (allow_all_users || allowed_users.contains(user_id));
+-                                                reset_human_mention_turns(&mut *bot_turns.lock().await, event, admitted);
++                                                if !event_deduper.claim(event_team, event, std::time::Instant::now()) { continue; }
++                                                reset_human_mention_turns(&mut *bot_turns.lock().await, event_team, event, admitted);
++                                                let ingress = ingress_order.register(slack_event_thread_identity(event_team, event));
+                                                 let event = event.clone();
+                                                 let adapter = adapter.clone();
+                                                 let router = router.clone();
+@@ -1146,6 +1269,7 @@
+                                                     .unwrap_or("")
+                                                     .to_string();
+                                                 tokio::spawn(async move {
++                                                    let _ingress = ingress.wait().await;
+                                                     handle_message(
+                                                         &event,
+                                                         &team_id,
+@@ -1211,11 +1335,15 @@
+                                                     }
+                                                 }
+ 
++                                                // Select the authoritative route before claiming delivery.
++                                                if route_mention_via_app_event(is_bot, is_dm, mentions_bot) { continue; }
++                                                if !event_deduper.claim(event_team, event, std::time::Instant::now()) { continue; }
++
+                                                 // Preserve eager peer observation for MultibotMentions and
+                                                 // streaming. Observation cannot increment turns or send warnings.
+                                                 if is_bot {
+                                                     if let Some(thread_ts) = event["thread_ts"].as_str() {
+-                                                        adapter.note_other_bot_in_thread(thread_ts).await;
++                                                        adapter.note_other_bot_in_thread(event_team, channel_id, thread_ts).await;
+                                                     }
+                                                 }
+ 
+@@ -1277,22 +1405,9 @@
+                                                     }
+                                                 }
+ 
+-                                                // Skip messages that @mention the bot — app_mention handles those
+-                                                // (except in DMs where app_mention doesn't fire)
+-                                                if route_mention_via_app_event(is_bot, is_dm, mentions_bot) { continue; }
+-
+-                                                // --- Bot turn tracking ---
+-                                                // Slack ignores self events before incrementing. Zero bypasses
+-                                                // both shared counters; positive limits still use the tracker.
+-                                                // Keyed on thread_ts when in a thread, else channel:ts.
+-                                                // Non-thread messages get a unique key per message, so the
+-                                                // counter never accumulates — intentional, because bot-to-bot
+-                                                // loops only happen inside threads.
+-                                                let turn_key = if let Some(thread_ts) = event["thread_ts"].as_str() {
+-                                                    thread_ts.to_string()
+-                                                } else {
+-                                                    format!("{}:{}", channel_id, event["ts"].as_str().unwrap_or(""))
+-                                                };
++                                                // Scope counters exactly like sessions, including top-level
++                                                // messages which become the roots of new threads.
++                                                let turn_key = slack_event_thread_identity(event_team, event);
+                                                 // Classify under the lock (order-sensitive, kept in the read
+                                                 // loop), but run any warning send AFTER releasing it; holding
+                                                 // the tracker mutex across `chat.postMessage` would stall turn
+@@ -1324,7 +1439,7 @@
+                                                                 platform: "slack".into(),
+                                                                 channel_id: channel_id.to_string(),
+                                                                 thread_id: event["thread_ts"].as_str().or_else(|| event["ts"].as_str()).map(|s| s.to_string()),
+-                                                                parent_id: None,
++                                                                parent_id: Some(event_team.to_string()),
+                                                                 origin_event_id: None,
+                                                             };
+                                                             let adapter = adapter.clone();
+@@ -1357,7 +1472,7 @@
+                                                                 }
+                                                                 let thread_ts = event["thread_ts"].as_str().unwrap_or("");
+                                                                 let (involved, _) = adapter
+-                                                                    .bot_participated_in_thread(channel_id, thread_ts)
++                                                                    .bot_participated_in_thread(event_team, channel_id, thread_ts)
+                                                                     .await;
+                                                                 if !involved {
+                                                                     debug!(channel_id, thread_ts, "bot not involved in thread, ignoring");
+@@ -1370,7 +1485,7 @@
+                                                                 }
+                                                                 let thread_ts = event["thread_ts"].as_str().unwrap_or("");
+                                                                 let (involved, other_bot) = adapter
+-                                                                    .bot_participated_in_thread(channel_id, thread_ts)
++                                                                    .bot_participated_in_thread(event_team, channel_id, thread_ts)
+                                                                     .await;
+                                                                 if !involved {
+                                                                     debug!(channel_id, thread_ts, "bot not involved in thread, ignoring");
+@@ -1399,6 +1514,7 @@
+                                                     .as_str()
+                                                     .unwrap_or("")
+                                                     .to_string();
++                                                let ingress = ingress_order.register(slack_event_thread_identity(event_team, event));
+                                                 let event = event.clone();
+                                                 let adapter = adapter.clone();
+                                                 let router = router.clone();
+@@ -1410,6 +1526,7 @@
+                                                 #[cfg(feature = "filestore")]
+                                                 let filestore = filestore.clone();
+                                                 tokio::spawn(async move {
++                                                    let _ingress = ingress.wait().await;
+                                                     handle_message(
+                                                         &event,
+                                                         &team_id,
+@@ -1618,7 +1735,7 @@
+                 platform: "slack".into(),
+                 channel_id: channel_id.clone(),
+                 thread_id: thread_ts.clone(),
+-                parent_id: None,
++                parent_id: Some(team_id.to_string()),
+                 origin_event_id: None,
+             },
+             message_id: ts.clone(),
+@@ -1749,7 +1866,7 @@
+                             platform: "slack".into(),
+                             channel_id: channel_id.clone(),
+                             thread_id: thread_ts.clone(),
+-                            parent_id: None,
++                            parent_id: Some(team_id.to_string()),
+                             origin_event_id: None,
+                         },
+                         message_id: ts.clone(),
+@@ -1896,7 +2013,7 @@
+             platform: "slack".into(),
+             channel_id: channel_id.clone(),
+             thread_id: thread_ts.clone().or_else(|| Some(ts.clone())),
+-            parent_id: None,
++            parent_id: Some(team_id.to_string()),
+             origin_event_id: None,
+         };
+         let file_list = failed_image_files
+@@ -1940,7 +2057,7 @@
+             platform: "slack".into(),
+             channel_id: channel_id.clone(),
+             thread_id: thread_ts.clone(),
+-            parent_id: None,
++            parent_id: Some(team_id.to_string()),
+             origin_event_id: None,
+         },
+         message_id: ts.clone(),
+@@ -1951,7 +2068,7 @@
+         platform: "slack".into(),
+         channel_id: channel_id.clone(),
+         thread_id: Some(thread_ts.unwrap_or(ts)),
+-        parent_id: None,
++        parent_id: Some(team_id.to_string()),
+         origin_event_id: None,
+     };
+ 
+@@ -1968,17 +2085,11 @@
+     };
+ 
+     let adapter_dyn: Arc<dyn ChatAdapter> = adapter.clone();
++    let scoped_thread = slack_event_thread_identity(team_id, event);
+     let other_bot_present = {
+         let cache = adapter.multibot_threads.lock().await;
+-        thread_channel.thread_id.as_deref().is_some_and(|ts| {
+-            cache
+-                .get(ts)
+-                .is_some_and(|inst| inst.elapsed() < adapter.session_ttl)
+-        })
+-    } || thread_channel
+-        .thread_id
+-        .as_deref()
+-        .is_some_and(|ts| adapter.multibot_cache.is_multibot(ts));
++        cache.get(&scoped_thread).is_some_and(|inst| inst.elapsed() < adapter.session_ttl)
++    } || adapter.multibot_cache.is_multibot(&scoped_thread);
+ 
+     // Best-effort echo before the agent reply so the user can verify STT.
+     crate::stt::post_echo(
+@@ -1990,11 +2101,7 @@
+     )
+     .await;
+ 
+-    let thread_id = thread_channel
+-        .thread_id
+-        .as_deref()
+-        .unwrap_or(&thread_channel.channel_id);
+-    let thread_key = dispatcher.key("slack", thread_id, &sender.sender_id);
++    let thread_key = dispatcher.key("slack", &scoped_thread, &sender.sender_id);
+     let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
+     let buf_msg = crate::dispatch::BufferedMessage {
+         sender_json,
+@@ -2430,12 +2537,150 @@
+     fn admitted_human_mentions_reset_bot_cap_but_denied_senders_do_not() {
+         let mut tracker = BotTurnTracker::new(2);
+         let event=serde_json::json!({"channel":"C","thread_ts":"root","ts":"message"});
+-        assert_eq!(tracker.classify_bot_message("root"), TurnAction::Continue);
+-        assert!(matches!(tracker.classify_bot_message("root"),TurnAction::WarnAndStop{..}));
+-        reset_human_mention_turns(&mut tracker,&event,false);
+-        assert_eq!(tracker.classify_bot_message("root"),TurnAction::SilentStop);
+-        reset_human_mention_turns(&mut tracker,&event,true);
+-        assert_eq!(tracker.classify_bot_message("root"),TurnAction::Continue);
++        assert_eq!(tracker.classify_bot_message("T:C:root"), TurnAction::Continue);
++        assert!(matches!(tracker.classify_bot_message("T:C:root"),TurnAction::WarnAndStop{..}));
++        reset_human_mention_turns(&mut tracker,"T",&event,false);
++        assert_eq!(tracker.classify_bot_message("T:C:root"),TurnAction::SilentStop);
++        reset_human_mention_turns(&mut tracker,"T",&event,true);
++        assert_eq!(tracker.classify_bot_message("T:C:root"),TurnAction::Continue);
++    }
++
++    #[tokio::test]
++    async fn slack_ingress_preserves_receive_order_without_blocking_other_threads() {
++        let mut order = SlackIngressOrder::default();
++        let a1 = order.register("T:C:A".into());
++        let a2 = order.register("T:C:A".into());
++        let b = order.register("T:C:B".into());
++        let (release, slow_preparation) = tokio::sync::oneshot::channel::<()>();
++        let (submitted, mut submissions) = tokio::sync::mpsc::unbounded_channel();
++        let first_sender = submitted.clone();
++        let first = tokio::spawn(async move {
++            let _turn = a1.wait().await;
++            let _ = slow_preparation.await;
++            first_sender.send("A1").unwrap();
++        });
++        let second_sender = submitted.clone();
++        // Deliberately spawn A2 before independent B, while A1 remains slow.
++        let second = tokio::spawn(async move {
++            let _turn = a2.wait().await;
++            second_sender.send("A2").unwrap();
++        });
++        let independent = tokio::spawn(async move {
++            let _turn = b.wait().await;
++            submitted.send("B").unwrap();
++        });
++        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(1), submissions.recv()).await.unwrap(), Some("B"));
++        assert!(matches!(submissions.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
++        release.send(()).unwrap();
++        assert_eq!(submissions.recv().await, Some("A1"));
++        assert_eq!(submissions.recv().await, Some("A2"));
++        first.await.unwrap();
++        second.await.unwrap();
++        independent.await.unwrap();
++    }
++
++    #[tokio::test]
++    async fn slack_ingress_cancelled_middle_worker_cannot_overtake_predecessor() {
++        let mut order = SlackIngressOrder::default();
++        let first = order.register("T:C:A".into()).wait().await;
++        let middle = order.register("T:C:A".into());
++        let last = order.register("T:C:A".into());
++        // Cancellation drops the ticket before it has finished waiting.
++        drop(middle);
++        let mut last_task = tokio::spawn(async move { let _turn = last.wait().await; });
++        assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut last_task).await.is_err());
++        drop(first);
++        tokio::time::timeout(std::time::Duration::from_secs(1), last_task).await.unwrap().unwrap();
++        wait_for_slack_ingress(order.tails.get("T:C:A").cloned()).await;
++        let _next = order.register("T:C:B".into());
++        assert!(!order.tails.contains_key("T:C:A"));
++    }
++
++    #[test]
++    fn slack_thread_identity_scopes_workspace_channel_and_root() {
++        let root = serde_json::json!({"channel":"C1", "ts":"100.001"});
++        let reply = serde_json::json!({"channel":"C1", "thread_ts":"100.001", "ts":"101.002"});
++        let other_channel = serde_json::json!({"channel":"C2", "thread_ts":"100.001", "ts":"101.002"});
++        let other_thread = serde_json::json!({"channel":"C1", "thread_ts":"100.002", "ts":"101.002"});
++        let key = slack_event_thread_identity("T1", &root);
++        assert_eq!(key, "T1:C1:100.001");
++        assert_eq!(key, slack_event_thread_identity("T1", &reply));
++        assert_ne!(key, slack_event_thread_identity("T2", &reply));
++        assert_ne!(key, slack_event_thread_identity("T1", &other_channel));
++        assert_ne!(key, slack_event_thread_identity("T1", &other_thread));
++    }
++
++    #[test]
++    fn slack_event_dedupe_retries_without_merging_channels_or_workspaces() {
++        let now = std::time::Instant::now();
++        let mut seen = SlackEventDeduper::default();
++        let mention = serde_json::json!({"type":"app_mention", "channel":"C1", "ts":"100.001"});
++        let message = serde_json::json!({"type":"message", "channel":"C1", "ts":"100.001"});
++        assert!(seen.claim("T1", &mention, now));
++        assert!(!seen.claim("T1", &mention, now)); // retry, including reconnect
++        assert!(!seen.claim("T1", &message, now)); // same physical message
++        assert!(seen.claim("T2", &message, now));
++        assert!(seen.claim("T1", &serde_json::json!({"channel":"C2", "ts":"100.001"}), now));
++        assert!(seen.claim("T1", &serde_json::json!({"channel":"C1", "thread_ts":"100.001", "ts":"100.002"}), now));
++        assert!(seen.claim("T1", &mention, now + SlackEventDeduper::TTL));
++    }
++
++    #[test]
++    fn ignored_human_message_route_does_not_consume_app_mention() {
++        let now = std::time::Instant::now();
++        let mut seen = SlackEventDeduper::default();
++        let event = serde_json::json!({"channel":"C1", "ts":"100.001"});
++        // Mirrors the read loop: select the event route before claiming it.
++        let message_selected = !route_mention_via_app_event(false, false, true);
++        assert!(!(message_selected && seen.claim("T1", &event, now)));
++        assert!(route_mention_via_app_event(false, false, true) && seen.claim("T1", &event, now));
++        assert!(!seen.claim("T1", &event, now));
++    }
++
++    #[test]
++    fn slack_event_dedupe_rejects_missing_identity_and_bounds_memory() {
++        let now = std::time::Instant::now();
++        let mut seen = SlackEventDeduper::default();
++        assert!(!seen.claim("", &serde_json::json!({"channel":"C", "ts":"1"}), now));
++        assert!(!seen.claim("T", &serde_json::json!({"channel":"C"}), now));
++        assert!(!seen.claim("T", &serde_json::json!({"ts":"1"}), now));
++        assert!(!seen.claim("T", &serde_json::json!({"channel":"C", "ts":""}), now));
++        for i in 0..=SlackEventDeduper::MAX {
++            assert!(seen.claim("T", &serde_json::json!({"channel":"C", "ts":i.to_string()}), now));
++        }
++        assert_eq!(seen.seen.len(), SlackEventDeduper::MAX);
++    }
++
++    #[test]
++    fn human_turn_reset_does_not_reset_another_channel_or_workspace() {
++        let mut tracker = BotTurnTracker::new(2);
++        for key in ["T:C:root", "T:OTHER:root", "OTHER:C:root"] {
++            assert_eq!(tracker.classify_bot_message(key), TurnAction::Continue);
++            assert!(matches!(tracker.classify_bot_message(key), TurnAction::WarnAndStop { .. }));
++        }
++        let event = serde_json::json!({"channel":"C", "thread_ts":"root", "ts":"message"});
++        reset_human_mention_turns(&mut tracker, "T", &event, true);
++        assert_eq!(tracker.classify_bot_message("T:C:root"), TurnAction::Continue);
++        assert_eq!(tracker.classify_bot_message("T:OTHER:root"), TurnAction::SilentStop);
++        assert_eq!(tracker.classify_bot_message("OTHER:C:root"), TurnAction::SilentStop);
++    }
++
++    #[tokio::test]
++    async fn slack_created_thread_preserves_workspace_and_raw_api_ids() {
++        let adapter = SlackAdapter::new("xoxb-test".into(), std::time::Duration::from_secs(60), AllowBots::Off, false, crate::multibot_cache::MultibotCache::load("/dev/null".into()), false);
++        let channel = ChannelRef {
++            platform: "slack".into(), channel_id: "C1".into(), thread_id: None,
++            parent_id: Some("T1".into()), origin_event_id: None,
++        };
++        let trigger = MessageRef { channel: channel.clone(), message_id: "100.001".into() };
++        let thread = adapter.create_thread(&channel, &trigger, "ignored").await.unwrap();
++        assert_eq!(thread.channel_id, "C1");
++        assert_eq!(thread.thread_id.as_deref(), Some("100.001"));
++        assert_eq!(thread.parent_id.as_deref(), Some("T1"));
++        assert_eq!(thread.session_key(), "slack:T1:C1:100.001");
++        let body = build_post_message_body(&thread.channel_id, thread.thread_id.as_deref(), "hello");
++        assert_eq!(body["channel"], "C1");
++        assert_eq!(body["thread_ts"], "100.001");
+     }
+ 
+     #[test]
+@@ -2501,6 +2746,23 @@
+         // missing stream is not resurrected:
+         assert_eq!(adapter.accumulate_degraded("MISSING", "x").await, None);
+     }
++    #[tokio::test]
++    async fn degraded_streams_with_equal_timestamps_are_isolated() {
++        let adapter = SlackAdapter::new("xoxb-test".into(), std::time::Duration::from_secs(60), AllowBots::Off, true, crate::multibot_cache::MultibotCache::load("/dev/null".into()), true);
++        let keys = [
++            slack_thread_identity("T1", "C1", "100.001"),
++            slack_thread_identity("T1", "C2", "100.001"),
++            slack_thread_identity("T2", "C1", "100.001"),
++        ];
++        for key in &keys {
++            adapter.insert_stream(key.clone(), StreamEntry::default()).await;
++        }
++        assert_eq!(adapter.accumulate_degraded(&keys[0], "first").await.as_deref(), Some("first"));
++        assert_eq!(adapter.accumulate_degraded(&keys[1], "second").await.as_deref(), Some("second"));
++        assert_eq!(adapter.accumulate_degraded(&keys[2], "third").await.as_deref(), Some("third"));
++        assert_eq!(adapter.accumulate_degraded(&keys[0], "!").await.as_deref(), Some("first!"));
++    }
++
+     use crate::adapter::ChatAdapter;
+ 
+     /// Bot's own `<@UID>` trigger mention is stripped.
+--- a/crates/openab-core/src/cron.rs
++++ b/crates/openab-core/src/cron.rs
+@@ -254,7 +254,7 @@
+     channel
+         .thread_id
+         .clone()
+-        .or_else(|| channel.parent_id.as_ref().map(|_| channel.channel_id.clone()))
++        .or_else(|| (channel.platform == "discord").then(|| channel.parent_id.as_ref().map(|_| channel.channel_id.clone())).flatten())
+ }
+ 
+ /// Validate all cronjob configs (fail-fast on bad cron expressions or timezones).
+@@ -717,11 +717,11 @@
+         sender_name: job.sender_name.clone(),
+         display_name: job.sender_name.clone(),
+         channel: job.platform.clone(),
+-        channel_id: reply_channel
+-            .parent_id
+-            .as_deref()
+-            .unwrap_or(&reply_channel.channel_id)
+-            .to_string(),
++        channel_id: if reply_channel.platform == "discord" {
++            reply_channel.parent_id.as_deref().unwrap_or(&reply_channel.channel_id).to_string()
++        } else {
++            reply_channel.channel_id.clone()
++        },
+         thread_id: cron_sender_thread_id(&reply_channel),
+         is_bot: true,
+         timestamp: Some(Utc::now().to_rfc3339()),
+--- a/crates/openab-core/src/secrets.rs
++++ b/crates/openab-core/src/secrets.rs
+@@ -364,7 +364,9 @@
+             exec: ExecSecretsConfig { timeout_seconds: 5 },
+             refs: HashMap::new(),
+         };
+-        let result = resolve_exec("test", "exec:///bin/false", &cfg).await;
++        // POSIX shell handles `false` without assuming /bin/false exists
++        // (macOS installs the standalone utility at /usr/bin/false).
++        let result = resolve_exec("test", "exec:///bin/sh -c false", &cfg).await;
+         assert!(result.is_err());
+         assert!(result.unwrap_err().to_string().contains("exited with"));
+     }
